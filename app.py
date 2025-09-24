@@ -1,5 +1,5 @@
 # app.py
-# Evidence Synthesis (v4.2a) — Criteria table + hidden editor, same single-page UI
+# Evidence Synthesis (v4.3 AI) — Same one-page UI + optional AI assist (semantic SBERT / zero-shot NLI)
 # Run: streamlit run app.py
 
 import io, os, re, json, math
@@ -24,10 +24,9 @@ try:
 except Exception:
     pass
 
-# PyMuPDF optional
 fitz = None
 try:
-    import fitz as _fitz
+    import fitz as _fitz  # PyMuPDF
     fitz = _fitz
 except Exception:
     pass
@@ -55,7 +54,20 @@ try:
 except Exception:
     HAS_MPL = False
 
-st.set_page_config(page_title="Evidence Synthesis • Auditable (v4.2a)", page_icon="📊", layout="wide")
+# ---------- AI (optional) ----------
+HAVE_SBERT = True
+HAVE_ZSHOT = True
+try:
+    from sentence_transformers import SentenceTransformer, util as sbert_util
+except Exception:
+    HAVE_SBERT = False
+
+try:
+    from transformers import pipeline
+except Exception:
+    HAVE_ZSHOT = False
+
+st.set_page_config(page_title="Evidence Synthesis • Auditable (v4.3 AI)", page_icon="📊", layout="wide")
 
 # ---------- Dimensions & Keywords (base) ----------
 DIMENSIONS = [
@@ -106,7 +118,7 @@ SECTION_CUES: Dict[str, List[str]] = {
     "Effectiveness of interventions": ["interventions","programme effectiveness","results","impact","outcomes","what worked","effectiveness"],
 }
 
-# ---------- v3-style seed (user provided 5×5 block) ----------
+# ---------- v3-style seed ----------
 DEFAULT_V3_BLOCK = """
 • learning loss, mental health, anxiety, violence, abuse, bullying	• climate change, covid, covid-19, pandemic, migration, gender	• stigma, taboo, coverage, affordability, access	• mhpss, psychosocial, u-report, online learning, school feeding, evaluation	• oecs, leadership, technical, evidence, u-report
 • poverty, dropout, mental health, anxiety, violence, abuse	• climate change, covid, covid-19, pandemic, migration, irregular status	• stigma, data gaps, coordination, coverage, access, legal status	• cash transfer, child friendly spaces, cfs, psychosocial, online learning, tvet	• coordination, mandate, crc, oecs, technical, advocacy
@@ -138,7 +150,6 @@ if "keymap" not in st.session_state:
 # Seed once with user-provided v3 block (append-only)
 if "custom_v3_seed_applied" not in st.session_state:
     st.session_state.custom_v3_seed_applied = False
-
 if not st.session_state.custom_v3_seed_applied:
     seed = parse_custom_block(DEFAULT_V3_BLOCK)
     for d in DIMENSIONS:
@@ -151,16 +162,6 @@ if not st.session_state.custom_v3_seed_applied:
 KEYMAP = st.session_state.keymap
 
 # ---------- Utilities ----------
-def warn_missing_deps():
-    missing = []
-    if pdfplumber is None: missing.append("pdfplumber")
-    if PyPDF2 is None: missing.append("PyPDF2")
-    if pytesseract is None: missing.append("pytesseract (OCR)")
-    if pdf2image is None: missing.append("pdf2image (Poppler)")
-    if not HAS_MPL: missing.append("matplotlib (for styled heatmap)")
-    if missing:
-        st.warning("Optional components not loaded: " + ", ".join(missing))
-
 def extract_with_pdfplumber(blob: bytes) -> List[str]:
     if pdfplumber is None: return []
     pages: List[str] = []
@@ -264,57 +265,22 @@ def headmap_dim_for_text(text: str, headmap: Dict[str, str]) -> str:
             continue
     return ""
 
-def classify_sentence(sentence: str, current_section: str = "", mapped_dim: str = "", boost_strength: int = 5, force_mapped: bool = False) -> Tuple[str, Dict[str,int], float]:
-    low = sentence.lower()
-    counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
-    for dim, keys in KEYMAP.items():
-        hits = 0
-        for k in keys:
-            hits += len(re.findall(r'\b' + re.escape(k) + r'\b', low))
-        counts[dim] = hits
+# ---------- AI loaders (cached) ----------
+@st.cache_resource(show_spinner=False)
+def load_sbert(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    if not HAVE_SBERT: return None
+    try:
+        return SentenceTransformer(model_name)
+    except Exception:
+        return None
 
-    if current_section:
-        for dim, cues in SECTION_CUES.items():
-            if any(c in current_section for c in cues):
-                counts[dim] += 1
-
-    if mapped_dim:
-        if force_mapped:
-            distinct_dims = sum(1 for v in counts.values() if v > 0)
-            confidence = min(1.0, (1 + distinct_dims) / 3.0)
-            return mapped_dim, counts, confidence
-        else:
-            counts[mapped_dim] += max(0, int(boost_strength))
-
-    best_dim = max(counts, key=lambda d: counts[d])
-    best_hits = counts[best_dim]
-    distinct_dims = sum(1 for v in counts.values() if v > 0)
-    confidence = 0.0 if best_hits <= 0 else min(1.0, (distinct_dims + (1 if mapped_dim else 0)) / 4.0)
-    return (best_dim if best_hits > 0 else ""), counts, confidence
-
-def gather_evidence(pages: List[str], headmap: Dict[str, str], boost_strength: int, force_mapped: bool, top_k_per_dim: int = 3) -> Tuple[Dict[str, List[Tuple[str,int,float]]], Dict[str,int], int]:
-    evidence: Dict[str, List[Tuple[str,int,float]]] = {dim: [] for dim in DIMENSIONS}
-    hit_counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
-    total_chars = sum(len(p) for p in pages)
-
-    for pi, ptext in enumerate(pages, start=1):
-        heads = detect_heading_lines(ptext)
-        section_hint = " ".join(heads[:3]).lower() if heads else ""
-        mapped_dim = headmap_dim_for_text(section_hint, headmap)
-
-        sentences = split_sentences(ptext)
-        for s in sentences:
-            dim, counts, conf = classify_sentence(s, current_section=section_hint, mapped_dim=mapped_dim, boost_strength=boost_strength, force_mapped=force_mapped)
-            for d, c in counts.items():
-                hit_counts[d] += c
-            if dim:
-                evidence[dim].append((s, pi, conf))
-
-    for dim in DIMENSIONS:
-        ev = evidence[dim]
-        ev = sorted(ev, key=lambda x: (len(x[0]), x[2]), reverse=True)[:top_k_per_dim]
-        evidence[dim] = ev
-    return evidence, hit_counts, total_chars
+@st.cache_resource(show_spinner=False)
+def load_zeroshot(model_name: str = "MoritzLaurer/deberta-v3-base-zeroshot-v2"):
+    if not HAVE_ZSHOT: return None
+    try:
+        return pipeline("zero-shot-classification", model=model_name)
+    except Exception:
+        return None
 
 # ---------- Scoring ----------
 def score_classic(hits: int) -> float:
@@ -368,9 +334,150 @@ def export_to_excel(dfs: Dict[str, DataFrame]) -> bytes:
     bio.seek(0)
     return bio.read()
 
-# ---------- UI (single-page) ----------
-st.title("📊 Evidence Synthesis: Auditable (v4.2a)")
-# warn_missing_deps()  # keep quiet to retain UI feel
+# ---------- Base (rules) classifier ----------
+def classify_sentence_rules(sentence: str, current_section: str = "", mapped_dim: str = "", boost_strength: int = 5, force_mapped: bool = False) -> Tuple[str, Dict[str,int], float]:
+    low = sentence.lower()
+    counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
+    for dim, keys in KEYMAP.items():
+        hits = 0
+        for k in keys:
+            hits += len(re.findall(r'\b' + re.escape(k) + r'\b', low))
+        counts[dim] = hits
+
+    if current_section:
+        for dim, cues in SECTION_CUES.items():
+            if any(c in current_section for c in cues):
+                counts[dim] += 1
+
+    if mapped_dim:
+        if force_mapped:
+            distinct_dims = sum(1 for v in counts.values() if v > 0)
+            confidence = min(1.0, (1 + distinct_dims) / 3.0)
+            return mapped_dim, counts, confidence
+        else:
+            counts[mapped_dim] += max(0, int(boost_strength))
+
+    best_dim = max(counts, key=lambda d: counts[d])
+    best_hits = counts[best_dim]
+    distinct_dims = sum(1 for v in counts.values() if v > 0)
+    confidence = 0.0 if best_hits <= 0 else min(1.0, (distinct_dims + (1 if mapped_dim else 0)) / 4.0)
+    return (best_dim if best_hits > 0 else ""), counts, confidence
+
+# ---------- AI-assisted classify (adds influence to counts) ----------
+def build_dim_prompts_from_keymap(keymap: Dict[str, List[str]], top_n: int = 12) -> Dict[str, str]:
+    prompts = {}
+    for dim in DIMENSIONS:
+        kws = ", ".join(keymap.get(dim, [])[:top_n])
+        prompts[dim] = f"{dim.lower()} — {kws}"
+    return prompts
+
+def classify_sentence_ai(sentence: str,
+                         counts: Dict[str,int],
+                         ai_mode: str,
+                         sbert_model,
+                         label_embeds,
+                         zshot_pipe,
+                         zshot_thresh: float,
+                         sem_thresh: float,
+                         z_boost: int,
+                         sem_boost: int) -> Tuple[Dict[str,int], List[str], float]:
+    """Returns updated counts, method_tags, ai_confidence"""
+    method_tags: List[str] = []
+    ai_conf = 0.0
+
+    if ai_mode in {"Semantic (SBERT)", "Ensemble"} and sbert_model is not None and label_embeds is not None:
+        try:
+            s_vec = sbert_model.encode([sentence], convert_to_tensor=True, normalize_embeddings=True)
+            sims = sbert_util.cos_sim(s_vec, label_embeds)[0]  # tensor [num_labels]
+            best_idx = int(sims.argmax().item())
+            best_dim = DIMENSIONS[best_idx]
+            best_sim = float(sims[best_idx])
+            if best_sim >= sem_thresh:
+                counts[best_dim] += max(1, int(round(sem_boost * best_sim)))
+                method_tags.append("semantic")
+                ai_conf = max(ai_conf, best_sim)
+        except Exception:
+            pass
+
+    if ai_mode in {"Zero-shot (NLI)", "Ensemble"} and zshot_pipe is not None:
+        try:
+            res = zshot_pipe(sentence, candidate_labels=DIMENSIONS, multi_label=False)
+            # transformers can return in different orders; align by 'labels'
+            labels = res.get("labels", [])
+            scores = res.get("scores", [])
+            if labels and scores:
+                best_dim = labels[0]
+                best_score = float(scores[0])
+                if best_score >= zshot_thresh:
+                    counts[best_dim] += max(1, int(round(z_boost * best_score)))
+                    method_tags.append("zeroshot")
+                    ai_conf = max(ai_conf, best_score)
+        except Exception:
+            pass
+
+    return counts, method_tags, ai_conf
+
+def gather_evidence(pages: List[str],
+                    headmap: Dict[str, str],
+                    boost_strength: int,
+                    force_mapped: bool,
+                    # AI args
+                    ai_mode: str,
+                    sbert_model,
+                    label_embeds,
+                    zshot_pipe,
+                    zshot_thresh: float,
+                    sem_thresh: float,
+                    z_boost: int,
+                    sem_boost: int,
+                    top_k_per_dim: int = 3) -> Tuple[Dict[str, List[Tuple[str,int,float,str]]], Dict[str,int], int]:
+    """Returns evidence[dim] -> List[(sentence, page, confidence, method)], hit_counts, total_chars"""
+    evidence: Dict[str, List[Tuple[str,int,float,str]]] = {dim: [] for dim in DIMENSIONS}
+    hit_counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
+    total_chars = sum(len(p) for p in pages)
+
+    for pi, ptext in enumerate(pages, start=1):
+        heads = detect_heading_lines(ptext)
+        section_hint = " ".join(heads[:3]).lower() if heads else ""
+        mapped_dim = headmap_dim_for_text(section_hint, headmap)
+        sentences = split_sentences(ptext)
+
+        for s in sentences:
+            # 1) rules
+            dim, counts, conf = classify_sentence_rules(s, current_section=section_hint, mapped_dim=mapped_dim,
+                                                        boost_strength=boost_strength, force_mapped=force_mapped)
+            method = "rules"
+
+            # 2) AI assist (optional) — adjusts counts in place
+            if ai_mode != "Off":
+                counts, tags, ai_conf = classify_sentence_ai(
+                    s, counts, ai_mode, sbert_model, label_embeds, zshot_pipe,
+                    zshot_thresh=zshot_thresh, sem_thresh=sem_thresh,
+                    z_boost=z_boost, sem_boost=sem_boost
+                )
+                if tags:
+                    method = "rules+" + ("ensemble" if len(tags) == 2 else tags[0])
+                    conf = min(1.0, max(conf, ai_conf * 0.9))  # blend confidence gently
+
+                # re-pick best dim after AI influence
+                dim = max(counts, key=lambda d: counts[d]) if any(v > 0 for v in counts.values()) else ""
+
+            # update doc-level hit counters
+            for d, c in counts.items():
+                hit_counts[d] += c
+
+            if dim:
+                evidence[dim].append((s, pi, conf, method))
+
+    # keep top_k per dim for compact evidence table
+    for dim in DIMENSIONS:
+        ev = evidence[dim]
+        ev = sorted(ev, key=lambda x: (len(x[0]), x[2]), reverse=True)[:top_k_per_dim]
+        evidence[dim] = ev
+    return evidence, hit_counts, total_chars
+
+# ---------- UI ----------
+st.title("📊 Evidence Synthesis: Auditable (v4.3 AI)")
 
 with st.sidebar:
     st.header("Inputs")
@@ -396,6 +503,21 @@ with st.sidebar:
     st.header("Heading → Dimension mapping")
     if "headmap" not in st.session_state:
         st.session_state.headmap = DEFAULT_HEADMAP.copy()
+
+    st.divider()
+    st.header("AI assist (optional)")
+    ai_mode = st.selectbox("Mode", ["Off","Semantic (SBERT)","Zero-shot (NLI)","Ensemble"], index=0)
+    sem_model_name = st.text_input("SBERT model", "sentence-transformers/all-MiniLM-L6-v2")
+    z_model_name   = st.text_input("Zero-shot model", "MoritzLaurer/deberta-v3-base-zeroshot-v2")
+    sem_thresh = st.slider("Semantic: similarity threshold", 0.30, 0.90, 0.45, 0.01)
+    zshot_thresh = st.slider("Zero-shot: confidence threshold", 0.40, 0.95, 0.65, 0.01)
+    sem_boost = st.slider("Semantic: boost", 1, 10, 4, 1)
+    z_boost   = st.slider("Zero-shot: boost", 1, 12, 5, 1)
+    if ai_mode != "Off":
+        if ai_mode in {"Semantic (SBERT)","Ensemble"} and not HAVE_SBERT:
+            st.warning("`sentence-transformers` not installed. Run: pip install sentence-transformers")
+        if ai_mode in {"Zero-shot (NLI)","Ensemble"} and not HAVE_ZSHOT:
+            st.warning("`transformers` not installed. Run: pip install transformers torch --upgrade")
 
 # Configure OCR paths
 if tesseract_path:
@@ -490,6 +612,23 @@ with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
             except Exception as e:
                 st.error(f"Failed to load JSON: {e}")
 
+# -------- Prepare AI handles (once) --------
+sbert_model = None
+label_embeds = None
+zshot_pipe = None
+if ai_mode in {"Semantic (SBERT)", "Ensemble"} and HAVE_SBERT:
+    sbert_model = load_sbert(sem_model_name)
+    if sbert_model is not None:
+        prompts = build_dim_prompts_from_keymap(KEYMAP, top_n=12)
+        label_texts = [prompts[d] for d in DIMENSIONS]
+        try:
+            label_embeds = sbert_model.encode(label_texts, convert_to_tensor=True, normalize_embeddings=True)
+        except Exception:
+            label_embeds = None
+
+if ai_mode in {"Zero-shot (NLI)", "Ensemble"} and HAVE_ZSHOT:
+    zshot_pipe = load_zeroshot(z_model_name)
+
 # -------- Process documents --------
 matrix_rows: List[Dict[str, Any]] = []
 evidence_tables: List[DataFrame] = []
@@ -511,13 +650,28 @@ with st.spinner("Extracting text, classifying sentences, and building audit trai
             for d in DIMENSIONS: mrow[d] = 0.0
             matrix_rows.append(mrow)
             ev_df = pd.DataFrame([{
-                "Document": Path(fname).stem, "Dimension": d, "Evidence (sentence)": "(no text extracted)", "Page": None, "Confidence": 0.0
+                "Document": Path(fname).stem, "Dimension": d, "Evidence (sentence)": "(no text extracted)",
+                "Page": None, "Confidence": 0.0, "Method": "rules"
             } for d in DIMENSIONS])
             evidence_tables.append(ev_df)
             diagnostics_rows.append({"Document": Path(fname).stem, "chars": 0, "method": method})
             continue
 
-        evidence, hit_counts, total_chars = gather_evidence(pages, headmap=st.session_state.headmap, boost_strength=boost_strength, force_mapped=force_mapped)
+        evidence, hit_counts, total_chars = gather_evidence(
+            pages,
+            headmap=st.session_state.headmap,
+            boost_strength=boost_strength,
+            force_mapped=force_mapped,
+            ai_mode=ai_mode,
+            sbert_model=sbert_model,
+            label_embeds=label_embeds,
+            zshot_pipe=zshot_pipe,
+            zshot_thresh=zshot_thresh,
+            sem_thresh=sem_thresh,
+            z_boost=z_boost,
+            sem_boost=sem_boost,
+            top_k_per_dim=3
+        )
 
         scores: Dict[str, float] = {}
         for dim in DIMENSIONS:
@@ -537,14 +691,35 @@ with st.spinner("Extracting text, classifying sentences, and building audit trai
         for dim in DIMENSIONS:
             ev = evidence[dim]
             if ev:
-                for s, pg, conf in ev:
-                    rows.append({"Document": Path(fname).stem, "Dimension": dim, "Evidence (sentence)": s, "Page": pg, "Confidence": round(conf, 2)})
+                for s, pg, conf, method_tag in ev:
+                    rows.append({
+                        "Document": Path(fname).stem,
+                        "Dimension": dim,
+                        "Evidence (sentence)": s,
+                        "Page": pg,
+                        "Confidence": round(conf, 2),
+                        "Method": method_tag
+                    })
             else:
-                rows.append({"Document": Path(fname).stem, "Dimension": dim, "Evidence (sentence)": "(no strong sentence detected)", "Page": None, "Confidence": 0.0})
-        ev_df = pd.DataFrame(rows, columns=["Document","Dimension","Evidence (sentence)","Page","Confidence"])
+                rows.append({
+                    "Document": Path(fname).stem,
+                    "Dimension": dim,
+                    "Evidence (sentence)": "(no strong sentence detected)",
+                    "Page": None,
+                    "Confidence": 0.0,
+                    "Method": "rules" if ai_mode == "Off" else ("rules+" + ("ensemble" if ai_mode=="Ensemble" else ("semantic" if ai_mode.startswith("Semantic") else "zeroshot")))
+                })
+        ev_df = pd.DataFrame(rows, columns=["Document","Dimension","Evidence (sentence)","Page","Confidence","Method"])
         evidence_tables.append(ev_df)
 
-        diag = {"Document": Path(fname).stem, "method": method, "chars": total_chars}
+        diag = {
+            "Document": Path(fname).stem,
+            "method": method,
+            "chars": total_chars,
+            "AI mode": ai_mode,
+            "SBERT model": (sem_model_name if sbert_model else None),
+            "Z-shot model": (z_model_name if zshot_pipe else None),
+        }
         for dim in DIMENSIONS:
             diag[f"{dim} hits"] = hit_counts[dim]
         diagnostics_rows.append(diag)
@@ -553,7 +728,7 @@ matrix_df = pd.DataFrame(matrix_rows, columns=["Document"] + DIMENSIONS)
 evidence_df = pd.concat(evidence_tables, ignore_index=True)
 diagnostics_df = pd.DataFrame(diagnostics_rows)
 
-# -------- Outputs (single-page, unchanged order) --------
+# -------- Outputs --------
 st.subheader("Synthesis Matrix (0–10)")
 st.caption("Table view of coverage per document × dimension.")
 st.dataframe(matrix_df, use_container_width=True)
@@ -573,7 +748,7 @@ st.subheader("Heatmap Interpretation")
 interp = interpret_heatmap(matrix_df)
 st.markdown(interp)
 
-# ---------- NEW: Criteria table + hidden editor (no other UI changes) ----------
+# ---------- Criteria table + hidden editor ----------
 st.subheader("Criteria (keywords)")
 crit_df = pd.DataFrame({
     "Dimension": DIMENSIONS,
@@ -599,13 +774,11 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
                 merged.update(tokens)
                 st.session_state.keymap[dsel] = sorted(merged)
             st.success(f"Updated keywords for: {dsel}")
-            KEYMAP = st.session_state.keymap  # refresh binding
     with colE2:
         if st.button("Reset ALL to defaults"):
             st.session_state.keymap = {d: sorted(set(map(str.lower, BASE_KEYMAP[d]))) for d in DIMENSIONS}
-            st.session_state.custom_v3_seed_applied = False  # allow re-seeding if needed
+            st.session_state.custom_v3_seed_applied = False
             st.success("All dimensions reset to base defaults.")
-            KEYMAP = st.session_state.keymap
     with colE3:
         st.write("")
 
@@ -623,7 +796,6 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
                 merged.update(parsed.get(d, []))
                 st.session_state.keymap[d] = sorted(merged)
         st.success("Bulk keywords applied.")
-        KEYMAP = st.session_state.keymap
 
     st.markdown("---")
     colJ1, colJ2 = st.columns(2)
@@ -645,7 +817,6 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
                 if isinstance(newk, dict):
                     st.session_state.keymap = {d: sorted(set(map(str.lower, newk.get(d, [])))) for d in DIMENSIONS}
                     st.success("Criteria JSON loaded.")
-                    KEYMAP = st.session_state.keymap
                 else:
                     st.error("Invalid JSON structure.")
             except Exception as e:
@@ -658,21 +829,29 @@ st.dataframe(diagnostics_df, use_container_width=True)
 st.subheader("Export")
 col1, col2 = st.columns(2)
 with col1:
-    # Build bytes on each run (simple & reliable). For huge corpora, you can cache to st.session_state.
     excel_bytes = export_to_excel({
         "Matrix": matrix_df,
         "Evidence": evidence_df,
         "Diagnostics": diagnostics_df,
         "Mappings": pd.DataFrame([{"pattern": k, "dimension": v} for k, v in st.session_state.headmap.items()]),
         "Criteria": pd.DataFrame([{"dimension": d, "keywords": ", ".join(st.session_state.keymap[d])} for d in DIMENSIONS]),
+        "AI_Settings": pd.DataFrame([{
+            "AI mode": ai_mode,
+            "SBERT model": sem_model_name if sbert_model else None,
+            "Zero-shot model": z_model_name if zshot_pipe else None,
+            "Semantic threshold": sem_thresh,
+            "Zero-shot threshold": zshot_thresh,
+            "Semantic boost": sem_boost,
+            "Zero-shot boost": z_boost,
+        }]),
     })
     st.download_button(
-        "⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria)",
+        "⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria + AI Settings)",
         data=excel_bytes,
-        file_name="Evidence_Synthesis_Audit_v42a.xlsx",
+        file_name="Evidence_Synthesis_Audit_v43_AI.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key="download_excel_pack",
     )
 with col2:
-    st.caption("Need a Word/PPT export? I can add that. Email me at: gmashaka@unicef.org")
+    st.caption("Need a Word/PPT export? I can add that: gmashaka@unicef.org")
