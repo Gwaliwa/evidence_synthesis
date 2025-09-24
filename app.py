@@ -345,9 +345,23 @@ def interpret_heatmap(matrix_df: DataFrame) -> str:
         bullets.append(f"• **{doc}** emphasizes **{top_dim}** ({r[top_dim]:.1f}/10).")
     return "\n".join(bullets)
 
+def _pick_excel_engine() -> str:
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            return "openpyxl"
+        except Exception:
+            return ""
+
 def export_to_excel(dfs: Dict[str, DataFrame]) -> bytes:
+    engine = _pick_excel_engine()
+    if not engine:
+        raise RuntimeError("No Excel writer engine available. Install either 'xlsxwriter' or 'openpyxl'.")
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(bio, engine=engine) as writer:
         for name, df in dfs.items():
             sname = name[:31] if len(name) > 31 else name
             df.to_excel(writer, index=False, sheet_name=sname)
@@ -356,8 +370,7 @@ def export_to_excel(dfs: Dict[str, DataFrame]) -> bytes:
 
 # ---------- UI (single-page) ----------
 st.title("📊 Evidence Synthesis: Auditable (v4.2a)")
-# Don't list optional deps each run; keep quiet to retain UI feel
-# warn_missing_deps()
+# warn_missing_deps()  # keep quiet to retain UI feel
 
 with st.sidebar:
     st.header("Inputs")
@@ -455,9 +468,15 @@ with st.sidebar.expander("Map headings to dimensions", expanded=False):
 with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("💾 Download current mappings"):
-            data = json.dumps(st.session_state.headmap, indent=2).encode()
-            st.download_button("Download headmap.json", data, file_name="headmap.json", use_container_width=True)
+        headmap_bytes = json.dumps(st.session_state.headmap, indent=2).encode("utf-8")
+        st.download_button(
+            "💾 Download headmap.json",
+            data=headmap_bytes,
+            file_name="headmap.json",
+            mime="application/json",
+            use_container_width=True,
+            key="download_headmap_json",
+        )
     with col2:
         up_map = st.file_uploader("Load headmap.json", type=["json"], accept_multiple_files=False)
         if up_map is not None:
@@ -561,7 +580,7 @@ crit_df = pd.DataFrame({
     "Keywords": [", ".join(KEYMAP[d]) for d in DIMENSIONS]
 })
 st.dataframe(crit_df, use_container_width=True, height=220)
-st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", use_container_width=True)
+st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", use_container_width=True, key="criteria_csv")
 
 with st.expander("Edit / override criteria (optional)", expanded=False):
     st.markdown("Update the keyword lists used for classification. Changes persist during this session.")
@@ -609,9 +628,15 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
     st.markdown("---")
     colJ1, colJ2 = st.columns(2)
     with colJ1:
-        if st.button("💾 Download criteria JSON"):
-            data = json.dumps(st.session_state.keymap, indent=2).encode()
-            st.download_button("Download keymap.json", data, file_name="keymap.json", use_container_width=True)
+        keymap_bytes = json.dumps(st.session_state.keymap, indent=2).encode("utf-8")
+        st.download_button(
+            "💾 Download criteria keymap.json",
+            data=keymap_bytes,
+            file_name="keymap.json",
+            mime="application/json",
+            use_container_width=True,
+            key="download_keymap_json",
+        )
     with colJ2:
         upk = st.file_uploader("Load criteria JSON", type=["json"], accept_multiple_files=False)
         if upk is not None:
@@ -633,14 +658,21 @@ st.dataframe(diagnostics_df, use_container_width=True)
 st.subheader("Export")
 col1, col2 = st.columns(2)
 with col1:
-    if st.button("⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria)"):
-        xls = export_to_excel({
-            "Matrix": matrix_df,
-            "Evidence": evidence_df,
-            "Diagnostics": diagnostics_df,
-            "Mappings": pd.DataFrame([{"pattern": k, "dimension": v} for k, v in st.session_state.headmap.items()]),
-            "Criteria": pd.DataFrame([{"dimension": d, "keywords": ", ".join(st.session_state.keymap[d])} for d in DIMENSIONS])
-        })
-        st.download_button("Download Excel", xls, file_name="Evidence_Synthesis_Audit_v42a.xlsx", use_container_width=True)
+    # Build bytes on each run (simple & reliable). For huge corpora, you can cache to st.session_state.
+    excel_bytes = export_to_excel({
+        "Matrix": matrix_df,
+        "Evidence": evidence_df,
+        "Diagnostics": diagnostics_df,
+        "Mappings": pd.DataFrame([{"pattern": k, "dimension": v} for k, v in st.session_state.headmap.items()]),
+        "Criteria": pd.DataFrame([{"dimension": d, "keywords": ", ".join(st.session_state.keymap[d])} for d in DIMENSIONS]),
+    })
+    st.download_button(
+        "⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria)",
+        data=excel_bytes,
+        file_name="Evidence_Synthesis_Audit_v42a.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="download_excel_pack",
+    )
 with col2:
-    st.caption("Need a Word/PPT export? I can add that.")
+    st.caption("Need a Word/PPT export? I can add that. Email me at: gmashaka@unicef.org")
