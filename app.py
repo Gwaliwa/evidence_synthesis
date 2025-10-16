@@ -1,8 +1,7 @@
 # app.py
-# Evidence Synthesis (v4.3 AI) — Same one-page UI + optional AI assist (semantic SBERT / zero-shot NLI)
-# Run: streamlit run app.py
+# Evidence Synthesis (v4.3 AI) — clean PDF-only upload, no samples, fresh-run caching, single status bar.
 
-import io, os, re, json, math
+import io, os, re, json, math, hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 import streamlit as st
@@ -68,6 +67,10 @@ except Exception:
     HAVE_ZSHOT = False
 
 st.set_page_config(page_title="Evidence Synthesis • Auditable (v4.3 AI)", page_icon="📊", layout="wide")
+
+# ---------- Upload limits ----------
+MAX_FILES = 600
+MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # ---------- Dimensions & Keywords (base) ----------
 DIMENSIONS = [
@@ -161,7 +164,22 @@ if not st.session_state.custom_v3_seed_applied:
 # Use session keymap for classification
 KEYMAP = st.session_state.keymap
 
-# ---------- Utilities ----------
+# ---------- Run freshness + file hashing ----------
+def _sha1_bytes(b: bytes) -> str:
+    h = hashlib.sha1(); h.update(b); return h.hexdigest()
+
+def _files_signature(file_tuples: List[Tuple[str, bytes]]) -> str:
+    # names + sizes only (order-insensitive) to detect a truly new upload set
+    parts = [f"{n}:{len(b)}" for (n, b) in file_tuples]
+    parts.sort()
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()
+
+if "run_id" not in st.session_state:
+    st.session_state.run_id = ""
+if "last_sig" not in st.session_state:
+    st.session_state.last_sig = ""
+
+# ---------- PDF extraction ----------
 def extract_with_pdfplumber(blob: bytes) -> List[str]:
     if pdfplumber is None: return []
     pages: List[str] = []
@@ -219,7 +237,14 @@ def extract_with_ocr(blob: bytes, dpi: int = 300, max_pages: int = 10, lang: str
         return []
     return texts
 
-def extract_pages(blob: bytes, dpi: int, max_pages: int, lang: str) -> Tuple[List[str], str]:
+@st.cache_data(show_spinner=False)
+def cached_extract_pages(file_hash: str,
+                         run_id: str,
+                         blob: bytes,
+                         dpi: int,
+                         max_pages: int,
+                         lang: str) -> Tuple[List[str], str]:
+    """Cache per (file_hash, run_id, dpi, max_pages, lang)."""
     for fn, name in [
         (extract_with_pymupdf, "PyMuPDF") if fitz is not None else (lambda b: [], "PyMuPDF"),
         (extract_with_pdfplumber, "pdfplumber"),
@@ -363,7 +388,7 @@ def classify_sentence_rules(sentence: str, current_section: str = "", mapped_dim
     confidence = 0.0 if best_hits <= 0 else min(1.0, (distinct_dims + (1 if mapped_dim else 0)) / 4.0)
     return (best_dim if best_hits > 0 else ""), counts, confidence
 
-# ---------- AI-assisted classify (adds influence to counts) ----------
+# ---------- AI-assisted classify ----------
 def build_dim_prompts_from_keymap(keymap: Dict[str, List[str]], top_n: int = 12) -> Dict[str, str]:
     prompts = {}
     for dim in DIMENSIONS:
@@ -381,14 +406,13 @@ def classify_sentence_ai(sentence: str,
                          sem_thresh: float,
                          z_boost: int,
                          sem_boost: int) -> Tuple[Dict[str,int], List[str], float]:
-    """Returns updated counts, method_tags, ai_confidence"""
     method_tags: List[str] = []
     ai_conf = 0.0
 
     if ai_mode in {"Semantic (SBERT)", "Ensemble"} and sbert_model is not None and label_embeds is not None:
         try:
             s_vec = sbert_model.encode([sentence], convert_to_tensor=True, normalize_embeddings=True)
-            sims = sbert_util.cos_sim(s_vec, label_embeds)[0]  # tensor [num_labels]
+            sims = sbert_util.cos_sim(s_vec, label_embeds)[0]
             best_idx = int(sims.argmax().item())
             best_dim = DIMENSIONS[best_idx]
             best_sim = float(sims[best_idx])
@@ -402,7 +426,6 @@ def classify_sentence_ai(sentence: str,
     if ai_mode in {"Zero-shot (NLI)", "Ensemble"} and zshot_pipe is not None:
         try:
             res = zshot_pipe(sentence, candidate_labels=DIMENSIONS, multi_label=False)
-            # transformers can return in different orders; align by 'labels'
             labels = res.get("labels", [])
             scores = res.get("scores", [])
             if labels and scores:
@@ -421,7 +444,6 @@ def gather_evidence(pages: List[str],
                     headmap: Dict[str, str],
                     boost_strength: int,
                     force_mapped: bool,
-                    # AI args
                     ai_mode: str,
                     sbert_model,
                     label_embeds,
@@ -431,7 +453,6 @@ def gather_evidence(pages: List[str],
                     z_boost: int,
                     sem_boost: int,
                     top_k_per_dim: int = 3) -> Tuple[Dict[str, List[Tuple[str,int,float,str]]], Dict[str,int], int]:
-    """Returns evidence[dim] -> List[(sentence, page, confidence, method)], hit_counts, total_chars"""
     evidence: Dict[str, List[Tuple[str,int,float,str]]] = {dim: [] for dim in DIMENSIONS}
     hit_counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
     total_chars = sum(len(p) for p in pages)
@@ -443,12 +464,12 @@ def gather_evidence(pages: List[str],
         sentences = split_sentences(ptext)
 
         for s in sentences:
-            # 1) rules
-            dim, counts, conf = classify_sentence_rules(s, current_section=section_hint, mapped_dim=mapped_dim,
-                                                        boost_strength=boost_strength, force_mapped=force_mapped)
+            dim, counts, conf = classify_sentence_rules(
+                s, current_section=section_hint, mapped_dim=mapped_dim,
+                boost_strength=boost_strength, force_mapped=force_mapped
+            )
             method = "rules"
 
-            # 2) AI assist (optional) — adjusts counts in place
             if ai_mode != "Off":
                 counts, tags, ai_conf = classify_sentence_ai(
                     s, counts, ai_mode, sbert_model, label_embeds, zshot_pipe,
@@ -457,19 +478,15 @@ def gather_evidence(pages: List[str],
                 )
                 if tags:
                     method = "rules+" + ("ensemble" if len(tags) == 2 else tags[0])
-                    conf = min(1.0, max(conf, ai_conf * 0.9))  # blend confidence gently
-
-                # re-pick best dim after AI influence
+                    conf = min(1.0, max(conf, ai_conf * 0.9))
                 dim = max(counts, key=lambda d: counts[d]) if any(v > 0 for v in counts.values()) else ""
 
-            # update doc-level hit counters
             for d, c in counts.items():
                 hit_counts[d] += c
 
             if dim:
                 evidence[dim].append((s, pi, conf, method))
 
-    # keep top_k per dim for compact evidence table
     for dim in DIMENSIONS:
         ev = evidence[dim]
         ev = sorted(ev, key=lambda x: (len(x[0]), x[2]), reverse=True)[:top_k_per_dim]
@@ -481,8 +498,8 @@ st.title("📊 Evidence Synthesis: Auditable (v4.3 AI)")
 
 with st.sidebar:
     st.header("Inputs")
-    up_files = st.file_uploader("Upload up to 5 PDFs", type=["pdf"], accept_multiple_files=True)
-    sample = st.button("📥 Load sample 5 docs (paths must exist)")
+    up_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    st.caption("Tip: For scanned PDFs, configure OCR below.")
     st.divider()
 
     st.header("OCR Settings")
@@ -533,34 +550,42 @@ if poppler_path:
     os.environ["PATH"] = poppler_path + os.pathsep + os.environ.get("PATH","")
     st.success("Poppler path added to PATH.")
 
-# -------- Load docs --------
+# -------- Load docs (upload only, PDF) --------
 docs: List[Tuple[str, bytes]] = []
-if sample:
-    sample_paths = [
-        "/mnt/data/Final Report_Participatory Research on Climate Change 2023.pdf",
-        "/mnt/data/GenU Wellbeing of Young People in the Eastern Caribbean 2022.pdf",
-        "/mnt/data/Subregional Survey on VAC in ECA 2024.pdf",
-        "/mnt/data/UNICEF MCPE Evaluation Report Final 2021.pdf",
-        "/mnt/data/UNICEF Venezuela Outflow Evaluation 2022 - report Trinidad & Tobago.pdf",
-    ]
-    for p in sample_paths:
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                docs.append((Path(p).name, f.read()))
-        else:
-            st.warning(f"Sample not found: {p}")
-elif up_files:
-    for f in up_files:
-        docs.append((f.name, f.read()))
 
-if not docs:
-    st.info("Upload PDFs or click 'Load sample 5 docs'. Configure OCR if scans.")
+if not up_files:
+    st.info("Upload one or more PDF files to start analysis.")
     st.stop()
 
-# -------- Build heading mapping UI --------
+if len(up_files) > MAX_FILES:
+    st.error(f"Too many files uploaded ({len(up_files)}). Limit: {MAX_FILES}.")
+    st.stop()
+
+total_bytes = sum(getattr(f, "size", 0) for f in up_files)
+if total_bytes > MAX_TOTAL_BYTES:
+    mb = total_bytes / (1024 * 1024)
+    st.error(f"Uploads too large ({mb:.1f} MB total). Limit ≈ {MAX_TOTAL_BYTES/(1024*1024):.0f} MB.")
+    st.stop()
+
+for f in up_files:
+    docs.append((f.name, f.read()))
+
+if not docs:
+    st.info("Upload PDFs to begin analysis.")
+    st.stop()
+
+# ---------- Fresh run per new upload set ----------
+current_sig = _files_signature(docs)  # docs = [(name, bytes)]
+if current_sig != st.session_state.last_sig:
+    st.session_state.last_sig = current_sig
+    st.session_state.run_id = hashlib.sha1(current_sig.encode()).hexdigest()[:12]
+    st.cache_data.clear()
+
+# -------- Build heading mapping UI (quick 2-page probe) --------
 candidate_heads = set()
 for fname, blob in docs:
-    pages_tmp, _ = extract_pages(blob, dpi=dpi, max_pages=2, lang=lang)
+    fh = _sha1_bytes(blob)
+    pages_tmp, _ = cached_extract_pages(fh, st.session_state.run_id, blob, dpi=dpi, max_pages=2, lang=lang)
     for ptxt in pages_tmp:
         for h in detect_heading_lines(ptxt):
             candidate_heads.add(h)
@@ -591,14 +616,7 @@ with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
     col1, col2 = st.columns(2)
     with col1:
         headmap_bytes = json.dumps(st.session_state.headmap, indent=2).encode("utf-8")
-        st.download_button(
-            "💾 Download headmap.json",
-            data=headmap_bytes,
-            file_name="headmap.json",
-            mime="application/json",
-            width="stretch",
-            key="download_headmap_json",
-        )
+
     with col2:
         up_map = st.file_uploader("Load headmap.json", type=["json"], accept_multiple_files=False)
         if up_map is not None:
@@ -634,12 +652,15 @@ matrix_rows: List[Dict[str, Any]] = []
 evidence_tables: List[DataFrame] = []
 diagnostics_rows: List[Dict[str, Any]] = []
 
-with st.spinner("Extracting text, classifying sentences, and building audit trail…"):
-    for fname, blob in docs:
-        pages, method = extract_pages(blob, dpi=dpi, max_pages=max_pages, lang=lang)
-        char_count = sum(len(p) for p in pages)
-        st.caption(f"{fname}: method={method}, total_chars={char_count}")
+progress = st.progress(0.0)
+status = st.empty()
 
+with st.spinner("Extracting text, classifying sentences, and building audit trail…"):
+    total_docs = len(docs)
+    for idx, (fname, blob) in enumerate(docs, start=1):
+        status.write(f"Processing {idx}/{total_docs}… {fname}")
+        fh = _sha1_bytes(blob)
+        pages, method = cached_extract_pages(fh, st.session_state.run_id, blob, dpi=dpi, max_pages=max_pages, lang=lang)
         if preview:
             for i, ptxt in enumerate(pages[:3], start=1):
                 snippet = (ptxt[:1500] + "…") if len(ptxt) > 1500 else ptxt
@@ -655,6 +676,7 @@ with st.spinner("Extracting text, classifying sentences, and building audit trai
             } for d in DIMENSIONS])
             evidence_tables.append(ev_df)
             diagnostics_rows.append({"Document": Path(fname).stem, "chars": 0, "method": method})
+            progress.progress(idx / total_docs)
             continue
 
         evidence, hit_counts, total_chars = gather_evidence(
@@ -724,6 +746,11 @@ with st.spinner("Extracting text, classifying sentences, and building audit trai
             diag[f"{dim} hits"] = hit_counts[dim]
         diagnostics_rows.append(diag)
 
+        progress.progress(idx / total_docs)
+
+status.write("Processing complete.")
+st.success(f"Done. Processed {len(docs)} document(s).")
+
 matrix_df = pd.DataFrame(matrix_rows, columns=["Document"] + DIMENSIONS)
 evidence_df = pd.concat(evidence_tables, ignore_index=True)
 diagnostics_df = pd.DataFrame(diagnostics_rows)
@@ -731,18 +758,18 @@ diagnostics_df = pd.DataFrame(diagnostics_rows)
 # -------- Outputs --------
 st.subheader("Synthesis Matrix (0–10)")
 st.caption("Table view of coverage per document × dimension.")
-st.dataframe(matrix_df, width="stretch")
+st.dataframe(matrix_df, use_container_width=True)
 
 st.subheader("Evidence with Page Numbers (for audit)")
-st.dataframe(evidence_df, width="stretch", height=420)
+st.dataframe(evidence_df, use_container_width=True, height=420)
 
 st.subheader("Heatmap")
 heat = matrix_df.set_index("Document")[DIMENSIONS]
 if HAS_MPL:
-    st.dataframe(heat.style.background_gradient(axis=None), width="stretch")
+    st.dataframe(heat.style.background_gradient(axis=None), use_container_width=True)
 else:
     st.info("matplotlib is not installed. Showing unstyled table instead. To enable colored heatmap: pip install matplotlib")
-    st.dataframe(heat, width="stretch")
+    st.dataframe(heat, use_container_width=True)
 
 st.subheader("Heatmap Interpretation")
 interp = interpret_heatmap(matrix_df)
@@ -754,8 +781,8 @@ crit_df = pd.DataFrame({
     "Dimension": DIMENSIONS,
     "Keywords": [", ".join(KEYMAP[d]) for d in DIMENSIONS]
 })
-st.dataframe(crit_df, width="stretch", height=220)
-st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", width="stretch", key="criteria_csv")
+st.dataframe(crit_df, use_container_width=True, height=220)
+st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", use_container_width=True, key="criteria_csv")
 
 with st.expander("Edit / override criteria (optional)", expanded=False):
     st.markdown("Update the keyword lists used for classification. Changes persist during this session.")
@@ -806,7 +833,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
             data=keymap_bytes,
             file_name="keymap.json",
             mime="application/json",
-            width="stretch",
+            use_container_width=True,
             key="download_keymap_json",
         )
     with colJ2:
@@ -823,7 +850,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
                 st.error(f"Failed to load JSON: {e}")
 
 st.subheader("Diagnostics (extraction + raw hits)")
-st.dataframe(diagnostics_df, width="stretch")
+st.dataframe(diagnostics_df, use_container_width=True)
 
 # -------- Export --------
 st.subheader("Export")
@@ -850,7 +877,7 @@ with col1:
         data=excel_bytes,
         file_name="Evidence_Synthesis_Audit_v43_AI.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
+        use_container_width=True,
         key="download_excel_pack",
     )
 with col2:
