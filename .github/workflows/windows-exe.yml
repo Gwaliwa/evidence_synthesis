@@ -24,7 +24,7 @@ jobs:
           pip install -r requirements.txt pyinstaller
           pip freeze > pip-freeze.txt
 
-      - name: Build EXE
+      - name: Build EXE (PyInstaller spec)
         run: |
           pyinstaller --clean EvidenceSynthesis.spec
           if (Test-Path dist) { dir dist -Recurse }
@@ -36,6 +36,7 @@ jobs:
           STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
           STREAMLIT_SERVER_PORT: "8501"
           STREAMLIT_SERVER_ADDRESS: "127.0.0.1"
+          STREAMLIT_LOG_LEVEL: "info"
         run: |
           Write-Host "Listing dist contents:"
           if (Test-Path dist) { dir dist -Recurse } else { Write-Error "dist/ not found"; exit 1 }
@@ -45,31 +46,40 @@ jobs:
             | Where-Object { $_.Name -like "*EvidenceSynthesisApp*.exe" } `
             | Select-Object -First 1 -ExpandProperty FullName
 
-          if (-not $exe) {
-            Write-Error "Could not find EvidenceSynthesisApp EXE under dist/"
-            exit 1
-          }
+          if (-not $exe) { Write-Error "Could not find EvidenceSynthesisApp EXE under dist/"; exit 1 }
 
           $workdir = Split-Path $exe -Parent
           Write-Host "Starting $exe with working directory $workdir ..."
           $p = Start-Process -FilePath $exe -WorkingDirectory $workdir -PassThru
 
-          # Wait for health
-          $deadline = (Get-Date).AddMinutes(2)
+          # Wait for health (allow extra time for first-run extraction)
+          $deadline = (Get-Date).AddMinutes(4)
           $ok = $false
           while ((Get-Date) -lt $deadline) {
             try {
               $r = Invoke-WebRequest -Uri "http://127.0.0.1:8501/healthz" -UseBasicParsing -TimeoutSec 5
               if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch { Start-Sleep -Seconds 2 }
+            } catch { Start-Sleep -Seconds 3 }
           }
 
           # Clean up the process
-          if ($p -and -not $p.HasExited) {
-            try { Stop-Process -Id $p.Id -Force } catch {}
-          }
+          if ($p -and -not $p.HasExited) { try { Stop-Process -Id $p.Id -Force } catch {} }
 
-          if (-not $ok) { Write-Error "App did not become healthy on /healthz"; exit 1 }
+          if (-not $ok) {
+            Write-Host "=== Attempting to print Streamlit logs (if any) ==="
+            $home = $env:USERPROFILE
+            $logdir = Join-Path $home ".streamlit\logs"
+            if (Test-Path $logdir) {
+              Get-ChildItem $logdir -Recurse | Sort-Object LastWriteTime -Desc | Select-Object -First 3 | ForEach-Object {
+                Write-Host "---- Log: $($_.FullName) ----"
+                Get-Content $_.FullName -Tail 200 -ErrorAction SilentlyContinue
+              }
+            } else {
+              Write-Host "(No ~/.streamlit/logs directory found.)"
+            }
+            Write-Error "App did not become healthy on /healthz"
+            exit 1
+          }
 
       - name: Upload artifacts
         if: always()
