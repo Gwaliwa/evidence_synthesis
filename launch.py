@@ -1,27 +1,30 @@
-# launch.py — start Streamlit server from a frozen EXE
-import os, sys, subprocess, shutil, tempfile
+# launch.py — start Streamlit server from a frozen EXE (PyInstaller-safe)
+import os
+import sys
 
-# When frozen (PyInstaller onefile), sources are in a temp dir exposed via _MEIPASS
+# Where the unpacked files live when frozen
 BASE = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
 
 def main():
-    # Ensure we have a real filesystem path to app.py for Streamlit to run.
-    src = os.path.join(BASE, "app.py")
-    if not os.path.exists(src):
-        # If bundled as data with a different name/path, adjust here.
-        raise FileNotFoundError(f"Cannot find app.py at {src}")
+    app_path = os.path.join(BASE, "app.py")
+    if not os.path.exists(app_path):
+        raise FileNotFoundError(f"Cannot find app.py at {app_path}")
 
-    # Spawn "python -m streamlit run app.py ..." using the embedded interpreter
-    py = sys.executable  # works in frozen EXE
-    args = [
-        py, "-m", "streamlit", "run", src,
+    # Programmatic entry into Streamlit CLI (works in frozen apps)
+    from streamlit.web import cli as stcli
+
+    # Build argv just like "streamlit run app.py ..."
+    sys.argv = [
+        "streamlit",
+        "run",
+        app_path,
         "--server.headless", "true",
         "--server.address", "127.0.0.1",
-        "--server.port", os.environ.get("PORT","8501"),
+        "--server.port", os.environ.get("PORT", "8501"),
         "--browser.gatherUsageStats", "false",
     ]
-    # In onefile EXE, let it inherit stdio (no console if built with --noconsole)
-    os.execv(py, args)  # replace current process
+    # This starts the Streamlit server and blocks
+    sys.exit(stcli.main())
 
 if __name__ == "__main__":
     main()
