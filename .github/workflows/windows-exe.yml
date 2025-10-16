@@ -3,107 +3,33 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
 
 jobs:
-  build-exe:
+  build-windows:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
-      - name: Show Python info
-        run: |
-          python --version
-          pip --version
+          python-version: '3.12'  # or 3.13 if compatible
 
       - name: Upgrade pip
-        run: python -m pip install --upgrade pip wheel setuptools
+        run: python -m pip install --upgrade pip setuptools wheel
 
-      - name: Verify files in repo
-        run: |
-          dir
-          if exist windows-build-requirements.txt (type windows-build-requirements.txt) else (echo "windows-build-requirements.txt MISSING" & exit /b 1)
-          if exist app.py (echo found app.py) else (echo "app.py missing; change workflow to your entry file" & exit /b 1)
-
-      - name: Install requirements (Windows-pinned)
+      - name: Install dependencies
         run: pip install -r windows-build-requirements.txt
 
-      - name: Freeze env
-        run: pip freeze > pip-freeze.txt
+      - name: Build executable
+        run: pyinstaller --onefile --noconsole app.py
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
-
-      - name: Install Tesseract & Poppler (Chocolatey)
-        run: |
-          choco install -y tesseract
-          choco install -y poppler
-        shell: powershell
-
-      - name: Stage vendor binaries
-        shell: powershell
-        run: |
-          New-Item -ItemType Directory -Force -Path vendor\tesseract | Out-Null
-          New-Item -ItemType Directory -Force -Path vendor\poppler\bin | Out-Null
-
-          $tessExe = "C:\Program Files\Tesseract-OCR\tesseract.exe"
-          if (!(Test-Path $tessExe)) { throw "tesseract.exe not found at $tessExe" }
-          Copy-Item $tessExe vendor\tesseract\tesseract.exe -Force
-
-          $tessdata = "C:\Program Files\Tesseract-OCR\tessdata"
-          if (!(Test-Path $tessdata)) { throw "tessdata not found; Tesseract install failed" }
-          Copy-Item "$tessdata" vendor\tesseract\tessdata -Recurse -Force
-
-          $popplerRoot = Get-ChildItem "C:\Program Files" -Filter "poppler*" -Directory | Select-Object -First 1
-          if ($null -eq $popplerRoot) { throw "Poppler root not found" }
-          $popplerBin = Join-Path $popplerRoot.FullName "Library\bin"
-          if (!(Test-Path $popplerBin)) { throw "Poppler bin not found" }
-          Copy-Item "$popplerBin\*" vendor\poppler\bin\ -Recurse -Force
-
-      - name: Show staged vendor tree
-        run: |
-          dir vendor
-          dir vendor\tesseract
-          dir vendor\tesseract\tessdata
-          dir vendor\poppler\bin
-
-      - name: Build (onedir with console for clearer logs)
-        shell: powershell
-        run: |
-          pyinstaller `
-            --name EvidenceSynthesis `
-            --console `
-            --add-binary "vendor\tesseract\tesseract.exe;vendor/tesseract" `
-            --add-data   "vendor\tesseract\tessdata;vendor/tesseract/tessdata" `
-            --add-binary "vendor\poppler\bin\*;vendor/poppler/bin" `
-            app.py
-
-      - name: List dist tree (if any)
-        if: always()
-        run: |
-          echo ==== TREE ====
-          dir dist
-          if exist dist\EvidenceSynthesis (dir dist\EvidenceSynthesis)
-
-      - name: Upload artifact (EXE folder)
-        if: success()
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EvidenceSynthesis-windows
-          path: dist/EvidenceSynthesis/**
-
-      - name: Upload logs (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-logs
-          path: |
-            pip-freeze.txt
-            dist/**
-            build/**
+          name: app-windows-exe
+          path: dist/*.exe

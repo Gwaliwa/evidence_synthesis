@@ -1,0 +1,40 @@
+# Core app requirements
+pyinstaller==6.16.0
+altgraph
+pefile
+pywin32-ctypes
+
+
+streamlit
+pandas
+numpy
+plotly
+matplotlib
+
+# OCR and PDF support (optional)
+pdfplumber
+PyPDF2
+pytesseract
+pillow
+
+# For data science / text processing
+scikit-learn
+sentence-transformers
+torch
+transformers
+
+# For file handling and Excel
+openpyxl
+xlrd
+
+# For building the EXE
+#pyinstaller==6.3.0
+altgraph
+pefile
+pywin32-ctypes
+
+# Optional: if you use json/yaml/configs
+pyyaml
+
+# Optional: progress bars / UX
+tqdm
