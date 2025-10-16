@@ -1,43 +1,12 @@
-# ===================================================
-# WINDOWS BUILD REQUIREMENTS for EvidenceSynthesisApp
-# ===================================================
-
-# ---------- Core app ----------
+# Minimal set to prove pipeline works
 streamlit
 pandas
 numpy
-plotly
-matplotlib
-
-# ---------- OCR & PDF support ----------
-pdfplumber
-PyPDF2
-pytesseract
-pillow
-pdf2image
-
-# ---------- Data science & AI ----------
-scikit-learn
-sentence-transformers
-torch
-transformers
-
-# ---------- Excel & file handling ----------
+pypdf
 openpyxl
-xlrd
 
-# ---------- Build tools (for PyInstaller EXE) ----------
+# Build tool
 pyinstaller==6.16.0
 altgraph
 pefile
 pywin32-ctypes
-
-# ---------- Optional utilities ----------
-pyyaml
-tqdm
-
-# ---------- Notes ----------
-# - No import statements or commas — each line is a package name.
-# - PyInstaller v6.16.0 supports Python 3.12+
-# - Torch, transformers, and sentence-transformers are optional AI helpers.
-# - This file works both locally and in GitHub Actions Windows runners.
