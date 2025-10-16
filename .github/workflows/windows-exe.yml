@@ -1,0 +1,83 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip wheel setuptools
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      # Install system binaries we need to bundle
+      - name: Install Tesseract & Poppler (Chocolatey)
+        run: |
+          choco install -y tesseract
+          choco install -y poppler
+        shell: powershell
+
+      # Prepare vendor/ directory with binaries to embed into the exe
+      - name: Stage vendor binaries
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path vendor\tesseract | Out-Null
+          New-Item -ItemType Directory -Force -Path vendor\poppler\bin | Out-Null
+
+          # Tesseract
+          $tessExe = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+          if (!(Test-Path $tessExe)) { throw "tesseract.exe not found at $tessExe" }
+          Copy-Item $tessExe vendor\tesseract\tesseract.exe -Force
+          # tessdata folder (languages)
+          $tessdata = "C:\Program Files\Tesseract-OCR\tessdata"
+          if (Test-Path $tessdata) {
+            Copy-Item "$tessdata" vendor\tesseract\tessdata -Recurse -Force
+          } else {
+            throw "tessdata not found; Tesseract install failed"
+          }
+
+          # Poppler bin (versioned dir like C:\Program Files\poppler-xx\Library\bin)
+          $popplerRoot = Get-ChildItem "C:\Program Files" -Filter "poppler*" -Directory | Select-Object -First 1
+          if ($null -eq $popplerRoot) { throw "Poppler root not found" }
+          $popplerBin = Join-Path $popplerRoot.FullName "Library\bin"
+          if (!(Test-Path $popplerBin)) { throw "Poppler bin not found" }
+          Copy-Item "$popplerBin\*" vendor\poppler\bin\ -Recurse -Force
+
+      # Build EXE (onefolder first for clarity—change to --onefile later if you prefer)
+      - name: Build EXE with PyInstaller
+        shell: powershell
+        run: |
+          pyinstaller `
+            --noconsole `
+            --name EvidenceSynthesis `
+            --add-binary "vendor\tesseract\tesseract.exe;vendor/tesseract" `
+            --add-data   "vendor\tesseract\tessdata;vendor/tesseract/tessdata" `
+            --add-binary "vendor\poppler\bin\*;vendor/poppler/bin" `
+            --collect-data matplotlib `
+            --collect-data transformers `
+            --collect-data sentence_transformers `
+            --collect-submodules torch `
+            app.py
+
+      - name: Upload artifact (EXE folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EvidenceSynthesis-windows
+          path: dist/EvidenceSynthesis/**

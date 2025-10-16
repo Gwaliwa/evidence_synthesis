@@ -7,6 +7,27 @@ from typing import Dict, List, Tuple, Any
 import streamlit as st
 import pandas as pd
 from pandas import DataFrame
+import os, sys
+import pytesseract
+
+# When running as a PyInstaller exe, files are unpacked under _MEIPASS
+BASE_DIR = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+
+# These paths will be injected by the workflow when we package on Windows:
+#   vendor\tesseract\tesseract.exe
+#   vendor\poppler\bin\*.exe
+TESS_PATH = os.path.join(BASE_DIR, "vendor", "tesseract", "tesseract.exe")
+POPPLER_BIN = os.path.join(BASE_DIR, "vendor", "poppler", "bin")
+
+# Tell pytesseract where tesseract.exe lives
+if os.path.exists(TESS_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESS_PATH
+
+# Ensure Poppler bin is on PATH (for pdf2image)
+if os.path.isdir(POPPLER_BIN):
+    os.environ["PATH"] = POPPLER_BIN + os.pathsep + os.environ.get("PATH", "")
+
+
 
 # ---------- Optional deps (graceful fallbacks) ----------
 pdfplumber = None
