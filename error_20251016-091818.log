@@ -1,0 +1,12 @@
+UNHANDLED EXCEPTION
+
+Traceback (most recent call last):
+  File "/Users/gmashaka/Documents/myprojects/envidence_synthesis/streamlit_evidence_synthesis_v4_2/app.py", line 101, in <module>
+    main()
+    ~~~~^^
+  File "/Users/gmashaka/Documents/myprojects/envidence_synthesis/streamlit_evidence_synthesis_v4_2/app.py", line 97, in main
+    ui()
+    ~~^^
+  File "/Users/gmashaka/Documents/myprojects/envidence_synthesis/streamlit_evidence_synthesis_v4_2/app.py", line 60, in ui
+    from pypdf import PdfReader
+ModuleNotFoundError: No module named 'pypdf'
