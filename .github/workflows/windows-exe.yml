@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r windows-build-requirements.txt
 
-      # ---------- Diagnostic build (folder, with console) ----------
+      # ---------- 1️⃣ Diagnostic build (folder, with console) ----------
       - name: Build (diagnostic onedir + console)
         run: >
           pyinstaller --clean --onedir --console
@@ -38,11 +38,27 @@ jobs:
           --hidden-import sklearn.utils._openmp_helpers
           app.py
 
-      - name: Show diagnostic build outputs
+      # (optional) quick test that diagnostic build runs
+      - name: Smoke test diagnostic (onedir)
         shell: pwsh
         run: |
-          Write-Host "Listing dist/ (diagnostic):"
-          Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
+          $exe = "dist\EvidenceSynthesisApp\EvidenceSynthesisApp.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--server.headless true --server.port 8502 --browser.gatherUsageStats false" -PassThru
+          $ok = $false
+          for ($i=0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8502/" -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+          if (-not $ok) {
+            Write-Host "❌ Diagnostic app didn’t respond on port 8502"
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            exit 1
+          }
+          Write-Host "✅ Diagnostic app responded on port 8502"
+          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
       - name: Zip diagnostic app folder
         shell: pwsh
@@ -58,7 +74,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # ---------- Release build (single .exe, no console) ----------
+      # ---------- 2️⃣ Release build (single .exe, no console) ----------
       - name: Build (release onefile + no console)
         run: >
           pyinstaller --clean --onefile --noconsole
@@ -71,14 +87,32 @@ jobs:
           --hidden-import sklearn.utils._openmp_helpers
           app.py
 
-      - name: Show release build outputs
+      # ✅ Smoke test release .exe before packaging
+      - name: Smoke test .exe (start, ping, stop)
         shell: pwsh
         run: |
-          Write-Host "Listing dist/ (release):"
-          Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
+          $exe = Join-Path "dist" "EvidenceSynthesisApp.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--server.headless true --server.port 8501 --browser.gatherUsageStats false" -PassThru
+
+          $ok = $false
+          for ($i=0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8501/" -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+
+          if (-not $ok) {
+            Write-Host "❌ App did not respond on http://127.0.0.1:8501/"
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            exit 1
+          }
+
+          Write-Host "✅ App responded on http://127.0.0.1:8501/"
+          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
       - name: Zip release exe
-        if: ${{ hashFiles('dist/*.exe') != '' || hashFiles('dist/**/*.exe') != '' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path upload | Out-Null
