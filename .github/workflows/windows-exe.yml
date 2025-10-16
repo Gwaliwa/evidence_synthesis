@@ -1,14 +1,13 @@
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-windows:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,106 +15,52 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip setuptools wheel
-
-      # Read your windows-build-requirements.txt.
-      # If it looks valid, copy to build-reqs.txt.
-      # If it has any 'import ' lines or commas/semicolons, fall back to safe inline deps.
-      - name: Prepare requirements (prefer repo file, safe fallback)
-        shell: pwsh
+      - name: Install deps
         run: |
-          $src = "windows-build-requirements.txt"
-          $dst = "build-reqs.txt"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pip freeze > pip-freeze.txt
 
-          $fallback = @'
-          # Safe fallback deps (minimal but enough to boot)
-          streamlit
-          pandas
-          numpy
-          openpyxl
-          pypdf
-          pyinstaller==6.16.0
-          altgraph
-          pefile
-          pywin32-ctypes
-          '@
-
-          if (Test-Path $src) {
-            Write-Host "Found $src — first 25 lines:"
-            Get-Content $src | Select-Object -First 25 | ForEach-Object { "  $_" }
-
-            $bad = $false
-            if (Select-String -Path $src -Pattern '^\s*import\s' -SimpleMatch) { $bad = $true }
-            if (Select-String -Path $src -Pattern ':' -SimpleMatch) { $bad = $true }
-            if (Select-String -Path $src -Pattern ',' -SimpleMatch) { $bad = $true }
-
-            if (-not $bad) {
-              Write-Host "✅ $src looks valid — using it"
-              Copy-Item $src $dst -Force
-            } else {
-              Write-Host "⚠️ $src has invalid lines — using SAFE FALLBACK"
-              $fallback | Set-Content -Path $dst -NoNewline
-            }
-          } else {
-            Write-Host "⚠️ $src not found — using SAFE FALLBACK"
-            $fallback | Set-Content -Path $dst -NoNewline
-          }
-
-          Write-Host "`nUsing requirements file: $dst (first 25 lines)"
-          Get-Content $dst | Select-Object -First 25
-
-      - name: Install dependencies
-        run: pip install -r build-reqs.txt
-
-      # Build onefile EXE with launcher.py as entry, app.py bundled as data
-      - name: Build (release onefile + launcher)
-        run: >
-          pyinstaller --clean --onefile --noconsole
-          --name EvidenceSynthesisApp
-          --add-data "app.py;."
-          --collect-all streamlit
-          --collect-all pandas
-          --collect-all numpy
-          launch.py
-
-      - name: Show dist
-        shell: pwsh
-        run: Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
-
-      # Start EXE; it now boots Streamlit via launch.py
-      - name: Smoke test .exe (start, ping, stop)
-        shell: pwsh
+      - name: Build EXE
         run: |
-          $exe = Join-Path "dist" "EvidenceSynthesisApp.exe"
-          if (!(Test-Path $exe)) { Write-Host "❌ No EXE"; exit 1 }
-          $p = Start-Process -FilePath $exe -PassThru
+          pyinstaller --clean EvidenceSynthesis.spec
+          if (Test-Path dist) { dir dist -Recurse }
+
+      - name: Smoke run (headless) + health check
+        shell: pwsh
+        env:
+          STREAMLIT_SERVER_HEADLESS: "true"
+          STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+          STREAMLIT_SERVER_PORT: "8501"
+          STREAMLIT_SERVER_ADDRESS: "127.0.0.1"
+        run: |
+          $exe = Join-Path "dist" "EvidenceSynthesisApp" "EvidenceSynthesisApp.exe"
+          Write-Host "Starting $exe ..."
+          Start-Process -FilePath $exe
+          $deadline = (Get-Date).AddMinutes(2)
           $ok = $false
-          for ($i=0; $i -lt 45; $i++) {
-            Start-Sleep -Seconds 1
+          while ((Get-Date) -lt $deadline) {
             try {
-              if ((Invoke-WebRequest "http://127.0.0.1:8501/" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $ok = $true; break }
-            } catch { }
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8501/healthz" -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch {
+              Start-Sleep -Seconds 2
+            }
           }
           if (-not $ok) {
-            Write-Host "❌ App did not respond on 8501"
-            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            Write-Error "App did not become healthy on /healthz"
             exit 1
           }
-          Write-Host "✅ App responded on 8501"
-          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
-      - name: Zip EXE
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\*.exe -DestinationPath EvidenceSynthesisApp.zip -Force
-          Get-ChildItem EvidenceSynthesisApp.zip | Select-Object Name, Length
-
-      - name: Upload artifact
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: EvidenceSynthesisApp
-          path: EvidenceSynthesisApp.zip
-          if-no-files-found: error
+          name: windows-exe
+          path: |
+            dist/**
+            pip-freeze.txt
+            **/streamlit*.log
+          if-no-files-found: warn
