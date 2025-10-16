@@ -596,7 +596,7 @@ with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
             data=headmap_bytes,
             file_name="headmap.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
             key="download_headmap_json",
         )
     with col2:
@@ -731,18 +731,18 @@ diagnostics_df = pd.DataFrame(diagnostics_rows)
 # -------- Outputs --------
 st.subheader("Synthesis Matrix (0–10)")
 st.caption("Table view of coverage per document × dimension.")
-st.dataframe(matrix_df, use_container_width=True)
+st.dataframe(matrix_df, width="stretch")
 
 st.subheader("Evidence with Page Numbers (for audit)")
-st.dataframe(evidence_df, use_container_width=True, height=420)
+st.dataframe(evidence_df, width="stretch", height=420)
 
 st.subheader("Heatmap")
 heat = matrix_df.set_index("Document")[DIMENSIONS]
 if HAS_MPL:
-    st.dataframe(heat.style.background_gradient(axis=None), use_container_width=True)
+    st.dataframe(heat.style.background_gradient(axis=None), width="stretch")
 else:
     st.info("matplotlib is not installed. Showing unstyled table instead. To enable colored heatmap: pip install matplotlib")
-    st.dataframe(heat, use_container_width=True)
+    st.dataframe(heat, width="stretch")
 
 st.subheader("Heatmap Interpretation")
 interp = interpret_heatmap(matrix_df)
@@ -754,8 +754,8 @@ crit_df = pd.DataFrame({
     "Dimension": DIMENSIONS,
     "Keywords": [", ".join(KEYMAP[d]) for d in DIMENSIONS]
 })
-st.dataframe(crit_df, use_container_width=True, height=220)
-st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", use_container_width=True, key="criteria_csv")
+st.dataframe(crit_df, width="stretch", height=220)
+st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", width="stretch", key="criteria_csv")
 
 with st.expander("Edit / override criteria (optional)", expanded=False):
     st.markdown("Update the keyword lists used for classification. Changes persist during this session.")
@@ -806,7 +806,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
             data=keymap_bytes,
             file_name="keymap.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
             key="download_keymap_json",
         )
     with colJ2:
@@ -823,7 +823,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
                 st.error(f"Failed to load JSON: {e}")
 
 st.subheader("Diagnostics (extraction + raw hits)")
-st.dataframe(diagnostics_df, use_container_width=True)
+st.dataframe(diagnostics_df, width="stretch")
 
 # -------- Export --------
 st.subheader("Export")
@@ -850,7 +850,7 @@ with col1:
         data=excel_bytes,
         file_name="Evidence_Synthesis_Audit_v43_AI.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
         key="download_excel_pack",
     )
 with col2:
