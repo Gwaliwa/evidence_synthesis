@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'  # or 3.13 if compatible
+          python-version: '3.12'    # 3.13 also works with the pins above
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip setuptools wheel
@@ -25,11 +25,72 @@ jobs:
       - name: Install dependencies
         run: pip install -r windows-build-requirements.txt
 
-      - name: Build executable
-        run: pyinstaller --onefile --noconsole app.py
+      # ---------- Diagnostic build (folder, with console) ----------
+      - name: Build (diagnostic onedir + console)
+        run: >
+          pyinstaller --clean --onedir --console
+          --name EvidenceSynthesisApp
+          --collect-all streamlit
+          --collect-all pandas
+          --collect-all numpy
+          --collect-all pyarrow
+          --hidden-import sklearn.utils._cython_blas
+          --hidden-import sklearn.utils._openmp_helpers
+          app.py
 
-      - name: Upload artifact
+      - name: Show diagnostic build outputs
+        shell: pwsh
+        run: |
+          Write-Host "Listing dist/ (diagnostic):"
+          Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
+
+      - name: Zip diagnostic app folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\EvidenceSynthesisApp\* -DestinationPath EvidenceSynthesisApp_onedir.zip -Force
+          Get-ChildItem EvidenceSynthesisApp_onedir.zip | Select-Object Name, Length
+
+      - name: Upload artifact (diagnostic)
         uses: actions/upload-artifact@v4
         with:
-          name: app-windows-exe
-          path: dist/*.exe
+          name: EvidenceSynthesisApp_onedir
+          path: EvidenceSynthesisApp_onedir.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      # ---------- Release build (single .exe, no console) ----------
+      - name: Build (release onefile + no console)
+        run: >
+          pyinstaller --clean --onefile --noconsole
+          --name EvidenceSynthesisApp
+          --collect-all streamlit
+          --collect-all pandas
+          --collect-all numpy
+          --collect-all pyarrow
+          --hidden-import sklearn.utils._cython_blas
+          --hidden-import sklearn.utils._openmp_helpers
+          app.py
+
+      - name: Show release build outputs
+        shell: pwsh
+        run: |
+          Write-Host "Listing dist/ (release):"
+          Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
+
+      - name: Zip release exe
+        if: ${{ hashFiles('dist/*.exe') != '' || hashFiles('dist/**/*.exe') != '' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          Copy-Item dist\*.exe upload\ -ErrorAction SilentlyContinue
+          Copy-Item dist\**\*.exe upload\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path upload\* -DestinationPath EvidenceSynthesisApp.zip -Force
+          Get-ChildItem EvidenceSynthesisApp.zip | Select-Object Name, Length
+
+      - name: Upload artifact (release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EvidenceSynthesisApp
+          path: EvidenceSynthesisApp.zip
+          if-no-files-found: error
+          retention-days: 7

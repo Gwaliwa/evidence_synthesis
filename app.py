@@ -1,35 +1,24 @@
-# app.py
-# Evidence Synthesis (v4.3 AI) — clean PDF-only upload, no samples, fresh-run caching, single status bar.
+# Evidence Synthesis (v4.3 AI) — clean PDF-only upload, optional OCR/AI, safe fallbacks, single status bar.
 
-import io, os, re, json, math, hashlib
+import io, os, re, json, math, hashlib, datetime, traceback
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
+
+import sys
 import streamlit as st
 import pandas as pd
 from pandas import DataFrame
-import os, sys
-import pytesseract
 
-# When running as a PyInstaller exe, files are unpacked under _MEIPASS
+# --------------------- Runtime base path (PyInstaller-safe) ---------------------
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
 
-# These paths will be injected by the workflow when we package on Windows:
-#   vendor\tesseract\tesseract.exe
-#   vendor\poppler\bin\*.exe
+# Optional vendor paths (only if you decide to ship binaries yourself later)
 TESS_PATH = os.path.join(BASE_DIR, "vendor", "tesseract", "tesseract.exe")
 POPPLER_BIN = os.path.join(BASE_DIR, "vendor", "poppler", "bin")
-
-# Tell pytesseract where tesseract.exe lives
-if os.path.exists(TESS_PATH):
-    pytesseract.pytesseract.tesseract_cmd = TESS_PATH
-
-# Ensure Poppler bin is on PATH (for pdf2image)
 if os.path.isdir(POPPLER_BIN):
     os.environ["PATH"] = POPPLER_BIN + os.pathsep + os.environ.get("PATH", "")
 
-
-
-# ---------- Optional deps (graceful fallbacks) ----------
+# --------------------- Optional dependencies (import guarded) -------------------
 pdfplumber = None
 try:
     import pdfplumber as _pdfplumber
@@ -51,49 +40,56 @@ try:
 except Exception:
     pass
 
-pytesseract = None
-pdf2image = None
-from PIL import Image
-
+Image = None
 try:
-    import pytesseract as _pytesseract
-    pytesseract = _pytesseract
+    from PIL import Image as _Image
+    Image = _Image
 except Exception:
     pass
 
+pdf2image = None
 try:
     from pdf2image import convert_from_bytes as _convert_from_bytes
     pdf2image = _convert_from_bytes
 except Exception:
     pass
 
-# matplotlib check for pandas Styler background_gradient
+pytesseract = None
+try:
+    import pytesseract as _pytesseract
+    # If we shipped a local tesseract.exe, point to it:
+    if os.path.exists(TESS_PATH):
+        _pytesseract.pytesseract.tesseract_cmd = TESS_PATH
+    pytesseract = _pytesseract
+except Exception:
+    pass
+
 HAS_MPL = True
 try:
     import matplotlib  # noqa: F401
 except Exception:
     HAS_MPL = False
 
-# ---------- AI (optional) ----------
 HAVE_SBERT = True
-HAVE_ZSHOT = True
 try:
     from sentence_transformers import SentenceTransformer, util as sbert_util
 except Exception:
     HAVE_SBERT = False
 
+HAVE_ZSHOT = True
 try:
     from transformers import pipeline
 except Exception:
     HAVE_ZSHOT = False
 
-st.set_page_config(page_title="Evidence Synthesis • Auditable (v4.3 AI)", page_icon="📊", layout="wide")
+# --------------------- Streamlit page config ---------------------
+st.set_page_config(page_title="Evidence Synthesis • Auditable (v4.3 AI)",
+                   page_icon="📊", layout="wide")
 
-# ---------- Upload limits ----------
+# --------------------- Limits and constants ---------------------
 MAX_FILES = 600
 MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
-# ---------- Dimensions & Keywords (base) ----------
 DIMENSIONS = [
     "Child rights deprivations",
     "Underlying causes",
@@ -142,7 +138,6 @@ SECTION_CUES: Dict[str, List[str]] = {
     "Effectiveness of interventions": ["interventions","programme effectiveness","results","impact","outcomes","what worked","effectiveness"],
 }
 
-# ---------- v3-style seed ----------
 DEFAULT_V3_BLOCK = """
 • learning loss, mental health, anxiety, violence, abuse, bullying	• climate change, covid, covid-19, pandemic, migration, gender	• stigma, taboo, coverage, affordability, access	• mhpss, psychosocial, u-report, online learning, school feeding, evaluation	• oecs, leadership, technical, evidence, u-report
 • poverty, dropout, mental health, anxiety, violence, abuse	• climate change, covid, covid-19, pandemic, migration, irregular status	• stigma, data gaps, coordination, coverage, access, legal status	• cash transfer, child friendly spaces, cfs, psychosocial, online learning, tvet	• coordination, mandate, crc, oecs, technical, advocacy
@@ -150,6 +145,16 @@ DEFAULT_V3_BLOCK = """
 • poverty, mental health, violence, abuse, indigence, out-of-school	• climate change, covid, covid-19, pandemic, migration, debt	• stigma, data gaps, coordination, coverage, access, capacity	• cash transfer, child friendly spaces, cfs, psychosocial, u-report, school feeding	• coordination, mandate, crc, oecs, leadership, technical
 • dropout, mental health, violence, abuse, exclusion, out-of-school	• covid, covid-19, pandemic, migration, irregular status, norms	• stigma, coordination, coverage, access, legal status, bureaucracy	• cash transfer, child friendly spaces, cfs, mhpss, psychosocial, u-report	• coordination, mandate, oecs, leadership, r4v, technical
 """.strip()
+
+# --------------------- Helpers ---------------------
+def write_crash_log():
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        with open(f"error_{ts}.log", "w", encoding="utf-8") as f:
+            f.write("UNHANDLED EXCEPTION\n\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
 
 def parse_custom_block(block: str) -> Dict[str, list]:
     agg = {d: set() for d in DIMENSIONS}
@@ -167,117 +172,13 @@ def parse_custom_block(block: str) -> Dict[str, list]:
                 agg[DIMENSIONS[idx]].add(tok)
     return {d: sorted(v) for d, v in agg.items()}
 
-# Initialize working KEYMAP in session (so edits persist)
-if "keymap" not in st.session_state:
-    st.session_state.keymap = {d: sorted(set(map(str.lower, BASE_KEYMAP[d]))) for d in DIMENSIONS}
-
-# Seed once with user-provided v3 block (append-only)
-if "custom_v3_seed_applied" not in st.session_state:
-    st.session_state.custom_v3_seed_applied = False
-if not st.session_state.custom_v3_seed_applied:
-    seed = parse_custom_block(DEFAULT_V3_BLOCK)
-    for d in DIMENSIONS:
-        merged = set(st.session_state.keymap[d])
-        merged.update(seed.get(d, []))
-        st.session_state.keymap[d] = sorted(merged)
-    st.session_state.custom_v3_seed_applied = True
-
-# Use session keymap for classification
-KEYMAP = st.session_state.keymap
-
-# ---------- Run freshness + file hashing ----------
 def _sha1_bytes(b: bytes) -> str:
     h = hashlib.sha1(); h.update(b); return h.hexdigest()
 
 def _files_signature(file_tuples: List[Tuple[str, bytes]]) -> str:
-    # names + sizes only (order-insensitive) to detect a truly new upload set
     parts = [f"{n}:{len(b)}" for (n, b) in file_tuples]
     parts.sort()
     return hashlib.sha1("|".join(parts).encode()).hexdigest()
-
-if "run_id" not in st.session_state:
-    st.session_state.run_id = ""
-if "last_sig" not in st.session_state:
-    st.session_state.last_sig = ""
-
-# ---------- PDF extraction ----------
-def extract_with_pdfplumber(blob: bytes) -> List[str]:
-    if pdfplumber is None: return []
-    pages: List[str] = []
-    try:
-        with pdfplumber.open(io.BytesIO(blob)) as pdf:
-            for p in pdf.pages:
-                t = p.extract_text() or ""
-                pages.append(t)
-    except Exception:
-        return []
-    return pages
-
-def extract_with_pypdf(blob: bytes) -> List[str]:
-    if PyPDF2 is None: return []
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(blob))
-        out: List[str] = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            out.append(t)
-        return out
-    except Exception:
-        return []
-
-def extract_with_pymupdf(blob: bytes) -> List[str]:
-    if fitz is None: return []
-    pages: List[str] = []
-    try:
-        doc = fitz.open(stream=blob, filetype="pdf")
-        for page in doc:
-            t = page.get_text("text") or ""
-            pages.append(t)
-    except Exception:
-        return []
-    return pages
-
-def extract_with_ocr(blob: bytes, dpi: int = 300, max_pages: int = 10, lang: str = "eng") -> List[str]:
-    if pdf2image is None or pytesseract is None: return []
-    texts: List[str] = []
-    try:
-        images = pdf2image(blob, dpi=dpi)
-        for i, img in enumerate(images[:max_pages]):
-            if not isinstance(img, Image.Image):
-                from PIL import Image as _Image
-                try:
-                    img = _Image.fromarray(img)
-                except Exception:
-                    texts.append("")
-                    continue
-            t = pytesseract.image_to_string(img, lang=lang, config="--psm 3 --oem 3")
-            texts.append(t or "")
-        if len(images) > max_pages:
-            texts.extend([""] * (len(images) - max_pages))
-    except Exception:
-        return []
-    return texts
-
-@st.cache_data(show_spinner=False)
-def cached_extract_pages(file_hash: str,
-                         run_id: str,
-                         blob: bytes,
-                         dpi: int,
-                         max_pages: int,
-                         lang: str) -> Tuple[List[str], str]:
-    """Cache per (file_hash, run_id, dpi, max_pages, lang)."""
-    for fn, name in [
-        (extract_with_pymupdf, "PyMuPDF") if fitz is not None else (lambda b: [], "PyMuPDF"),
-        (extract_with_pdfplumber, "pdfplumber"),
-        (extract_with_pypdf, "PyPDF2"),
-    ]:
-        pages = fn(blob)
-        if sum(len(p.strip()) for p in pages) >= 50:
-            return pages, name
-    pages = extract_with_ocr(blob, dpi=dpi, max_pages=max_pages, lang=lang)
-    if sum(len(p.strip()) for p in pages) >= 30:
-        return pages, "OCR"
-    return [], "none"
 
 SENT_SPLIT = re.compile(r'(?<=[\.\?\!])\s+(?=[A-Z0-9“"])')
 
@@ -311,7 +212,82 @@ def headmap_dim_for_text(text: str, headmap: Dict[str, str]) -> str:
             continue
     return ""
 
-# ---------- AI loaders (cached) ----------
+# --------------------- Cache and state ---------------------
+if "keymap" not in st.session_state:
+    st.session_state.keymap = {d: sorted(set(map(str.lower, BASE_KEYMAP[d]))) for d in DIMENSIONS}
+
+if "custom_v3_seed_applied" not in st.session_state:
+    st.session_state.custom_v3_seed_applied = False
+if not st.session_state.custom_v3_seed_applied:
+    seed = parse_custom_block(DEFAULT_V3_BLOCK)
+    for d in DIMENSIONS:
+        merged = set(st.session_state.keymap[d]); merged.update(seed.get(d, []))
+        st.session_state.keymap[d] = sorted(merged)
+    st.session_state.custom_v3_seed_applied = True
+
+KEYMAP = st.session_state.keymap
+
+if "run_id" not in st.session_state:
+    st.session_state.run_id = ""
+if "last_sig" not in st.session_state:
+    st.session_state.last_sig = ""
+
+@st.cache_data(show_spinner=False)
+def cached_extract_pages(file_hash: str, run_id: str, blob: bytes,
+                         dpi: int, max_pages: int, lang: str) -> Tuple[List[str], str]:
+    # Try fast text methods first
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=blob, filetype="pdf")
+            pages = [(p.get_text("text") or "") for p in doc]
+            if sum(len(p.strip()) for p in pages) >= 50:
+                return pages, "PyMuPDF"
+        except Exception:
+            pass
+
+    if pdfplumber is not None:
+        try:
+            out = []
+            with pdfplumber.open(io.BytesIO(blob)) as pdf:
+                for p in pdf.pages:
+                    out.append(p.extract_text() or "")
+            if sum(len(p.strip()) for p in out) >= 50:
+                return out, "pdfplumber"
+        except Exception:
+            pass
+
+    if PyPDF2 is not None:
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(blob))
+            out = [(page.extract_text() or "") for page in reader.pages]
+            if sum(len(p.strip()) for p in out) >= 50:
+                return out, "PyPDF2"
+        except Exception:
+            pass
+
+    # OCR fallback
+    if pdf2image is not None and pytesseract is not None and Image is not None:
+        try:
+            images = pdf2image(blob, dpi=dpi)
+            texts: List[str] = []
+            for img in images[:max_pages]:
+                if not isinstance(img, Image.Image):
+                    try:
+                        img = Image.fromarray(img)
+                    except Exception:
+                        texts.append(""); continue
+                t = pytesseract.image_to_string(img, lang=lang, config="--psm 3 --oem 3") or ""
+                texts.append(t)
+            if len(images) > max_pages:
+                texts.extend([""] * (len(images) - max_pages))
+            if sum(len(p.strip()) for p in texts) >= 30:
+                return texts, "OCR"
+        except Exception:
+            pass
+
+    return [], "none"
+
+# --------------------- AI loaders (cached) ---------------------
 @st.cache_resource(show_spinner=False)
 def load_sbert(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
     if not HAVE_SBERT: return None
@@ -328,7 +304,7 @@ def load_zeroshot(model_name: str = "MoritzLaurer/deberta-v3-base-zeroshot-v2"):
     except Exception:
         return None
 
-# ---------- Scoring ----------
+# --------------------- Scoring ---------------------
 def score_classic(hits: int) -> float:
     return float(min(10, hits))
 
@@ -380,8 +356,10 @@ def export_to_excel(dfs: Dict[str, DataFrame]) -> bytes:
     bio.seek(0)
     return bio.read()
 
-# ---------- Base (rules) classifier ----------
-def classify_sentence_rules(sentence: str, current_section: str = "", mapped_dim: str = "", boost_strength: int = 5, force_mapped: bool = False) -> Tuple[str, Dict[str,int], float]:
+# --------------------- Rule-based + AI classification ---------------------
+def classify_sentence_rules(sentence: str, current_section: str = "",
+                            mapped_dim: str = "", boost_strength: int = 5,
+                            force_mapped: bool = False) -> Tuple[str, Dict[str,int], float]:
     low = sentence.lower()
     counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
     for dim, keys in KEYMAP.items():
@@ -409,7 +387,6 @@ def classify_sentence_rules(sentence: str, current_section: str = "", mapped_dim
     confidence = 0.0 if best_hits <= 0 else min(1.0, (distinct_dims + (1 if mapped_dim else 0)) / 4.0)
     return (best_dim if best_hits > 0 else ""), counts, confidence
 
-# ---------- AI-assisted classify ----------
 def build_dim_prompts_from_keymap(keymap: Dict[str, List[str]], top_n: int = 12) -> Dict[str, str]:
     prompts = {}
     for dim in DIMENSIONS:
@@ -417,16 +394,10 @@ def build_dim_prompts_from_keymap(keymap: Dict[str, List[str]], top_n: int = 12)
         prompts[dim] = f"{dim.lower()} — {kws}"
     return prompts
 
-def classify_sentence_ai(sentence: str,
-                         counts: Dict[str,int],
-                         ai_mode: str,
-                         sbert_model,
-                         label_embeds,
-                         zshot_pipe,
-                         zshot_thresh: float,
-                         sem_thresh: float,
-                         z_boost: int,
-                         sem_boost: int) -> Tuple[Dict[str,int], List[str], float]:
+def classify_sentence_ai(sentence: str, counts: Dict[str,int], ai_mode: str,
+                         sbert_model, label_embeds, zshot_pipe,
+                         zshot_thresh: float, sem_thresh: float,
+                         z_boost: int, sem_boost: int) -> Tuple[Dict[str,int], List[str], float]:
     method_tags: List[str] = []
     ai_conf = 0.0
 
@@ -461,19 +432,11 @@ def classify_sentence_ai(sentence: str,
 
     return counts, method_tags, ai_conf
 
-def gather_evidence(pages: List[str],
-                    headmap: Dict[str, str],
-                    boost_strength: int,
-                    force_mapped: bool,
-                    ai_mode: str,
-                    sbert_model,
-                    label_embeds,
-                    zshot_pipe,
-                    zshot_thresh: float,
-                    sem_thresh: float,
-                    z_boost: int,
-                    sem_boost: int,
-                    top_k_per_dim: int = 3) -> Tuple[Dict[str, List[Tuple[str,int,float,str]]], Dict[str,int], int]:
+def gather_evidence(pages: List[str], headmap: Dict[str, str], boost_strength: int,
+                    force_mapped: bool, ai_mode: str, sbert_model, label_embeds,
+                    zshot_pipe, zshot_thresh: float, sem_thresh: float,
+                    z_boost: int, sem_boost: int, top_k_per_dim: int = 3
+                    ) -> Tuple[Dict[str, List[Tuple[str,int,float,str]]], Dict[str,int], int]:
     evidence: Dict[str, List[Tuple[str,int,float,str]]] = {dim: [] for dim in DIMENSIONS}
     hit_counts: Dict[str, int] = {dim: 0 for dim in DIMENSIONS}
     total_chars = sum(len(p) for p in pages)
@@ -514,7 +477,7 @@ def gather_evidence(pages: List[str],
         evidence[dim] = ev
     return evidence, hit_counts, total_chars
 
-# ---------- UI ----------
+# --------------------- UI ---------------------
 st.title("📊 Evidence Synthesis: Auditable (v4.3 AI)")
 
 with st.sidebar:
@@ -553,11 +516,11 @@ with st.sidebar:
     z_boost   = st.slider("Zero-shot: boost", 1, 12, 5, 1)
     if ai_mode != "Off":
         if ai_mode in {"Semantic (SBERT)","Ensemble"} and not HAVE_SBERT:
-            st.warning("`sentence-transformers` not installed. Run: pip install sentence-transformers")
+            st.warning("`sentence-transformers` not installed. (Optional) pip install sentence-transformers")
         if ai_mode in {"Zero-shot (NLI)","Ensemble"} and not HAVE_ZSHOT:
-            st.warning("`transformers` not installed. Run: pip install transformers torch --upgrade")
+            st.warning("`transformers` not installed. (Optional) pip install transformers torch")
 
-# Configure OCR paths
+# Configure OCR external tool paths (if provided)
 if tesseract_path:
     try:
         import pytesseract as _pt
@@ -571,9 +534,7 @@ if poppler_path:
     os.environ["PATH"] = poppler_path + os.pathsep + os.environ.get("PATH","")
     st.success("Poppler path added to PATH.")
 
-# -------- Load docs (upload only, PDF) --------
-docs: List[Tuple[str, bytes]] = []
-
+# --------------------- Load docs ---------------------
 if not up_files:
     st.info("Upload one or more PDF files to start analysis.")
     st.stop()
@@ -588,21 +549,20 @@ if total_bytes > MAX_TOTAL_BYTES:
     st.error(f"Uploads too large ({mb:.1f} MB total). Limit ≈ {MAX_TOTAL_BYTES/(1024*1024):.0f} MB.")
     st.stop()
 
-for f in up_files:
-    docs.append((f.name, f.read()))
+docs: List[Tuple[str, bytes]] = [(f.name, f.read()) for f in up_files if f is not None]
 
 if not docs:
     st.info("Upload PDFs to begin analysis.")
     st.stop()
 
-# ---------- Fresh run per new upload set ----------
-current_sig = _files_signature(docs)  # docs = [(name, bytes)]
+# Fresh run per new upload set
+current_sig = _files_signature(docs)
 if current_sig != st.session_state.last_sig:
     st.session_state.last_sig = current_sig
     st.session_state.run_id = hashlib.sha1(current_sig.encode()).hexdigest()[:12]
     st.cache_data.clear()
 
-# -------- Build heading mapping UI (quick 2-page probe) --------
+# Quick 2-page probe to propose heading mappings
 candidate_heads = set()
 for fname, blob in docs:
     fh = _sha1_bytes(blob)
@@ -637,7 +597,8 @@ with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
     col1, col2 = st.columns(2)
     with col1:
         headmap_bytes = json.dumps(st.session_state.headmap, indent=2).encode("utf-8")
-
+        st.download_button("💾 Download headmap.json", data=headmap_bytes,
+                           file_name="headmap.json", mime="application/json", use_container_width=True)
     with col2:
         up_map = st.file_uploader("Load headmap.json", type=["json"], accept_multiple_files=False)
         if up_map is not None:
@@ -651,7 +612,7 @@ with st.sidebar.expander("Save / Load mappings (JSON)", expanded=False):
             except Exception as e:
                 st.error(f"Failed to load JSON: {e}")
 
-# -------- Prepare AI handles (once) --------
+# Prepare AI handles (if enabled and installed)
 sbert_model = None
 label_embeds = None
 zshot_pipe = None
@@ -668,7 +629,7 @@ if ai_mode in {"Semantic (SBERT)", "Ensemble"} and HAVE_SBERT:
 if ai_mode in {"Zero-shot (NLI)", "Ensemble"} and HAVE_ZSHOT:
     zshot_pipe = load_zeroshot(z_model_name)
 
-# -------- Process documents --------
+# --------------------- Process documents ---------------------
 matrix_rows: List[Dict[str, Any]] = []
 evidence_tables: List[DataFrame] = []
 diagnostics_rows: List[Dict[str, Any]] = []
@@ -776,7 +737,7 @@ matrix_df = pd.DataFrame(matrix_rows, columns=["Document"] + DIMENSIONS)
 evidence_df = pd.concat(evidence_tables, ignore_index=True)
 diagnostics_df = pd.DataFrame(diagnostics_rows)
 
-# -------- Outputs --------
+# --------------------- Outputs ---------------------
 st.subheader("Synthesis Matrix (0–10)")
 st.caption("Table view of coverage per document × dimension.")
 st.dataframe(matrix_df, use_container_width=True)
@@ -789,21 +750,18 @@ heat = matrix_df.set_index("Document")[DIMENSIONS]
 if HAS_MPL:
     st.dataframe(heat.style.background_gradient(axis=None), use_container_width=True)
 else:
-    st.info("matplotlib is not installed. Showing unstyled table instead. To enable colored heatmap: pip install matplotlib")
+    st.info("matplotlib is not installed. Showing unstyled table instead.")
     st.dataframe(heat, use_container_width=True)
 
 st.subheader("Heatmap Interpretation")
-interp = interpret_heatmap(matrix_df)
-st.markdown(interp)
+st.markdown(interpret_heatmap(matrix_df))
 
-# ---------- Criteria table + hidden editor ----------
 st.subheader("Criteria (keywords)")
-crit_df = pd.DataFrame({
-    "Dimension": DIMENSIONS,
-    "Keywords": [", ".join(KEYMAP[d]) for d in DIMENSIONS]
-})
+crit_df = pd.DataFrame({"Dimension": DIMENSIONS,
+                        "Keywords": [", ".join(KEYMAP[d]) for d in DIMENSIONS]})
 st.dataframe(crit_df, use_container_width=True, height=220)
-st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(), file_name="criteria_keywords.csv", use_container_width=True, key="criteria_csv")
+st.download_button("Download criteria (CSV)", crit_df.to_csv(index=False).encode(),
+                   file_name="criteria_keywords.csv", use_container_width=True, key="criteria_csv")
 
 with st.expander("Edit / override criteria (optional)", expanded=False):
     st.markdown("Update the keyword lists used for classification. Changes persist during this session.")
@@ -818,8 +776,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
             if mode == "Replace":
                 st.session_state.keymap[dsel] = sorted(set(tokens))
             else:
-                merged = set(st.session_state.keymap[dsel])
-                merged.update(tokens)
+                merged = set(st.session_state.keymap[dsel]); merged.update(tokens)
                 st.session_state.keymap[dsel] = sorted(merged)
             st.success(f"Updated keywords for: {dsel}")
     with colE2:
@@ -827,12 +784,12 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
             st.session_state.keymap = {d: sorted(set(map(str.lower, BASE_KEYMAP[d]))) for d in DIMENSIONS}
             st.session_state.custom_v3_seed_applied = False
             st.success("All dimensions reset to base defaults.")
-    with colE3:
-        st.write("")
 
     st.markdown("---")
     st.caption("Paste 5 groups per line (Deprivations | Causes | Barriers | Interventions | UNICEF advantage).")
-    block = st.text_area("Bulk paste (v3-style)", placeholder="• learning loss, mental health, ... \t • climate change, ... \t • ... \t • ... \t • ...", height=120)
+    block = st.text_area("Bulk paste (v3-style)",
+                         placeholder="• learning loss, mental health, ... \t • climate change, ... \t • ... \t • ... \t • ...",
+                         height=120)
     mode2 = st.radio("Apply bulk as", ["Append", "Replace (all dims)"], index=0, horizontal=True, key="bulkmode")
     if st.button("Apply bulk"):
         parsed = parse_custom_block(block)
@@ -840,8 +797,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
             st.session_state.keymap = parsed
         else:
             for d in DIMENSIONS:
-                merged = set(st.session_state.keymap[d])
-                merged.update(parsed.get(d, []))
+                merged = set(st.session_state.keymap[d]); merged.update(parsed.get(d, []))
                 st.session_state.keymap[d] = sorted(merged)
         st.success("Bulk keywords applied.")
 
@@ -849,14 +805,10 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
     colJ1, colJ2 = st.columns(2)
     with colJ1:
         keymap_bytes = json.dumps(st.session_state.keymap, indent=2).encode("utf-8")
-        st.download_button(
-            "💾 Download criteria keymap.json",
-            data=keymap_bytes,
-            file_name="keymap.json",
-            mime="application/json",
-            use_container_width=True,
-            key="download_keymap_json",
-        )
+        st.download_button("💾 Download criteria keymap.json",
+                           data=keymap_bytes, file_name="keymap.json",
+                           mime="application/json", use_container_width=True,
+                           key="download_keymap_json")
     with colJ2:
         upk = st.file_uploader("Load criteria JSON", type=["json"], accept_multiple_files=False)
         if upk is not None:
@@ -873,7 +825,7 @@ with st.expander("Edit / override criteria (optional)", expanded=False):
 st.subheader("Diagnostics (extraction + raw hits)")
 st.dataframe(diagnostics_df, use_container_width=True)
 
-# -------- Export --------
+# --------------------- Export ---------------------
 st.subheader("Export")
 col1, col2 = st.columns(2)
 with col1:
@@ -885,21 +837,18 @@ with col1:
         "Criteria": pd.DataFrame([{"dimension": d, "keywords": ", ".join(st.session_state.keymap[d])} for d in DIMENSIONS]),
         "AI_Settings": pd.DataFrame([{
             "AI mode": ai_mode,
-            "SBERT model": sem_model_name if sbert_model else None,
-            "Zero-shot model": z_model_name if zshot_pipe else None,
+            "SBERT model": sbert_model is not None and sem_model_name or None,
+            "Zero-shot model": zshot_pipe is not None and z_model_name or None,
             "Semantic threshold": sem_thresh,
             "Zero-shot threshold": zshot_thresh,
-            "Semantic boost": sem_boost,
-            "Zero-shot boost": z_boost,
+            "Semantic boost": z_boost,
+            "Zero-shot boost": sem_boost,
         }]),
     })
-    st.download_button(
-        "⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria + AI Settings)",
-        data=excel_bytes,
-        file_name="Evidence_Synthesis_Audit_v43_AI.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        key="download_excel_pack",
-    )
+    st.download_button("⬇️ Download Excel (Matrix + Evidence + Mappings + Diagnostics + Criteria + AI Settings)",
+                       data=excel_bytes,
+                       file_name="Evidence_Synthesis_Audit_v43_AI.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True, key="download_excel_pack")
 with col2:
-    st.caption("Need a Word/PPT export? I can add that: gmashaka@unicef.org")
+    st.caption("Need a Word/PPT export? Can be added later.")
