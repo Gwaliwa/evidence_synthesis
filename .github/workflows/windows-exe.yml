@@ -3,23 +3,15 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   build-windows:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show workspace & files
-        shell: pwsh
-        run: |
-          Write-Host "PWD:" (Get-Location).Path
-          Write-Host "`nRepo root listing:"
-          Get-ChildItem -Force
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,148 +21,101 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip setuptools wheel
 
-      # ---- Read existing file; if bad, write a clean one to build-reqs.txt ----
-      - name: Prepare clean requirements
+      # Read your windows-build-requirements.txt.
+      # If it looks valid, copy to build-reqs.txt.
+      # If it has any 'import ' lines or commas/semicolons, fall back to safe inline deps.
+      - name: Prepare requirements (prefer repo file, safe fallback)
         shell: pwsh
         run: |
-          $clean = @'
-          # ===================================================
-          # WINDOWS BUILD REQUIREMENTS for EvidenceSynthesisApp
-          # ===================================================
+          $src = "windows-build-requirements.txt"
+          $dst = "build-reqs.txt"
 
-          # ---------- Core app ----------
+          $fallback = @'
+          # Safe fallback deps (minimal but enough to boot)
           streamlit
           pandas
           numpy
-          plotly
-          matplotlib
-
-          # ---------- OCR & PDF support ----------
-          pdfplumber
-          PyPDF2
-          pytesseract
-          pillow
-          pdf2image
-
-          # ---------- Data science & AI ----------
-          scikit-learn
-          sentence-transformers
-          torch
-          transformers
-
-          # ---------- Excel & file handling ----------
           openpyxl
-          xlrd
-
-          # ---------- Build tools (for PyInstaller EXE) ----------
+          pypdf
           pyinstaller==6.16.0
           altgraph
           pefile
           pywin32-ctypes
-
-          # ---------- Optional utilities ----------
-          pyyaml
-          tqdm
           '@
 
-          $src = "windows-build-requirements.txt"
-          $dst = "build-reqs.txt"
-
           if (Test-Path $src) {
-            Write-Host "Found $src — showing first 20 lines:"
-            Get-Content $src | Select-Object -First 20 | ForEach-Object { "  $_" }
+            Write-Host "Found $src — first 25 lines:"
+            Get-Content $src | Select-Object -First 25 | ForEach-Object { "  $_" }
 
-            # Detect any 'import ' at line start (bad file)
-            $bad = Select-String -Path $src -Pattern '^\s*import\s' -SimpleMatch
-            if ($bad) {
-              Write-Host "⚠️ Detected 'import' statements in $src — writing CLEAN requirements to $dst"
-              $clean | Set-Content -Path $dst -NoNewline
-            } else {
-              Write-Host "✅ $src looks like a proper requirements file — copying to $dst"
+            $bad = $false
+            if (Select-String -Path $src -Pattern '^\s*import\s' -SimpleMatch) { $bad = $true }
+            if (Select-String -Path $src -Pattern ':' -SimpleMatch) { $bad = $true }
+            if (Select-String -Path $src -Pattern ',' -SimpleMatch) { $bad = $true }
+
+            if (-not $bad) {
+              Write-Host "✅ $src looks valid — using it"
               Copy-Item $src $dst -Force
+            } else {
+              Write-Host "⚠️ $src has invalid lines — using SAFE FALLBACK"
+              $fallback | Set-Content -Path $dst -NoNewline
             }
           } else {
-            Write-Host "⚠️ $src not found — writing CLEAN requirements to $dst"
-            $clean | Set-Content -Path $dst -NoNewline
+            Write-Host "⚠️ $src not found — using SAFE FALLBACK"
+            $fallback | Set-Content -Path $dst -NoNewline
           }
 
-          Write-Host "`nUsing requirements file: $dst"
-          Get-Content $dst | Select-Object -First 30
+          Write-Host "`nUsing requirements file: $dst (first 25 lines)"
+          Get-Content $dst | Select-Object -First 25
 
       - name: Install dependencies
         run: pip install -r build-reqs.txt
 
-      # ---------- Build single-file EXE ----------
-      - name: Build (release onefile + no console)
+      # Build onefile EXE with launcher.py as entry, app.py bundled as data
+      - name: Build (release onefile + launcher)
         run: >
           pyinstaller --clean --onefile --noconsole
           --name EvidenceSynthesisApp
+          --add-data "app.py;."
           --collect-all streamlit
           --collect-all pandas
           --collect-all numpy
-          app.py
+          launch.py
 
-      - name: Show dist/
+      - name: Show dist
         shell: pwsh
         run: Get-ChildItem -Recurse -File dist | Select-Object FullName, Length
 
-      # ---------- Smoke test the EXE on the runner ----------
-      - name: Smoke test .exe (start, ping, stop, log on fail)
+      # Start EXE; it now boots Streamlit via launch.py
+      - name: Smoke test .exe (start, ping, stop)
         shell: pwsh
         run: |
           $exe = Join-Path "dist" "EvidenceSynthesisApp.exe"
-          if (!(Test-Path $exe)) {
-            Write-Host "❌ EXE not found at $exe"
-            exit 1
-          }
-
-          $out = "streamlit-out.log"
-          $err = "streamlit-err.log"
-          $args = @(
-            "--server.headless","true",
-            "--server.address","127.0.0.1",
-            "--server.port","8501",
-            "--browser.gatherUsageStats","false"
-          )
-          $p = Start-Process -FilePath $exe -ArgumentList $args `
-               -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
-
+          if (!(Test-Path $exe)) { Write-Host "❌ No EXE"; exit 1 }
+          $p = Start-Process -FilePath $exe -PassThru
           $ok = $false
           for ($i=0; $i -lt 45; $i++) {
             Start-Sleep -Seconds 1
             try {
-              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8501/" -UseBasicParsing -TimeoutSec 2
-              if ($resp.StatusCode -eq 200) { $ok = $true; break }
+              if ((Invoke-WebRequest "http://127.0.0.1:8501/" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $ok = $true; break }
             } catch { }
           }
-
           if (-not $ok) {
-            Write-Host "❌ App did not respond on http://127.0.0.1:8501/"
-            if (Test-Path $out) { Write-Host "`n--- STDOUT (tail) ---"; Get-Content $out -Tail 200 }
-            if (Test-Path $err) { Write-Host "`n--- STDERR (tail) ---"; Get-Content $err -Tail 200 }
-            $warn = "build\EvidenceSynthesisApp\warn-EvidenceSynthesisApp.txt"
-            if (Test-Path $warn) { Write-Host "`n--- PyInstaller warnings ---"; Get-Content $warn -Tail 200 }
+            Write-Host "❌ App did not respond on 8501"
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
             exit 1
           }
-
-          Write-Host "✅ App responded on http://127.0.0.1:8501/"
+          Write-Host "✅ App responded on 8501"
           if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
-      # ---------- Zip + upload artifact ----------
-      - name: Zip release exe
+      - name: Zip EXE
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path upload | Out-Null
-          Copy-Item dist\*.exe upload\ -ErrorAction SilentlyContinue
-          Copy-Item dist\**\*.exe upload\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path upload\* -DestinationPath EvidenceSynthesisApp.zip -Force
+          Compress-Archive -Path dist\*.exe -DestinationPath EvidenceSynthesisApp.zip -Force
           Get-ChildItem EvidenceSynthesisApp.zip | Select-Object Name, Length
 
-      - name: Upload artifact (release)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EvidenceSynthesisApp
           path: EvidenceSynthesisApp.zip
           if-no-files-found: error
-          retention-days: 7
