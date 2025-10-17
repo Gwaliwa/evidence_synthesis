@@ -1,17 +1,26 @@
-# --- core runtime deps your app imports ---
+# Build tooling
+pyinstaller==6.16.0
+
+# Core runtime
 streamlit
 pandas
 numpy
-matplotlib
+pillow
+
+# PDF/text extraction (optional; app handles absence gracefully)
 pdfplumber
 PyPDF2
-pytesseract
-pillow
+pymupdf
 pdf2image
+pytesseract
 
-# excel writers (your app exports xlsx)
+# Visualization / export
+matplotlib
 openpyxl
 xlsxwriter
 
-# --- builder ---
-pyinstaller==6.16.0
+# (Optional AI – left out to keep the EXE smaller; your app already degrades gracefully)
+# sentence-transformers
+# transformers
+# torch
+# scikit-learn

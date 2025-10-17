@@ -3,12 +3,12 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -19,87 +19,73 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('windows-build-requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Upgrade pip tooling
+      - name: Upgrade pip
         run: python -m pip install --upgrade pip setuptools wheel
 
+      # Install dependencies (use a file if present; otherwise minimal set)
       - name: Install dependencies
-        run: pip install -r windows-build-requirements.txt
+        shell: pwsh
+        run: |
+          if (Test-Path windows-build-requirements.txt) {
+            pip install -r windows-build-requirements.txt
+          } elseif (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          } else {
+            pip install streamlit pandas numpy
+          }
 
-      # --- Build the EXE using launcher as entrypoint ---
-      - name: Build (onefile + launcher, include metadata)
+      - name: Ensure PyInstaller
+        run: pip install pyinstaller
+
+      # PowerShell-friendly version probe (no Bash heredoc)
+      - name: Show Streamlit version (sanity)
+        run: python -c "import importlib.metadata as m; print('streamlit:', m.version('streamlit'))"
+
+      # Build single-file EXE; bundle app.py next to the binary at runtime
+      - name: Build (onefile)
         run: >
           pyinstaller --clean --onefile --noconsole
           --name EvidenceSynthesisApp
           --add-data "app.py;."
-          --collect-all streamlit
           --collect-all pandas
           --collect-all numpy
-          --collect-all pillow
-          --collect-all PyPDF2
-          --collect-all pdfplumber
-          --collect-all fitz
-          --collect-all pdf2image
-          --collect-all pytesseract
-          --collect-all matplotlib
-          --collect-all openpyxl
-          --collect-all xlsxwriter
-          --copy-metadata streamlit
-          --copy-metadata altair
-          --copy-metadata watchdog
-          --copy-metadata tornado
-          --copy-metadata protobuf
-          launch.py
+          --collect-metadata streamlit
+          run_app.py
 
-      # --- Smoke-test the binary: start it, wait for HTTP to respond, then stop ---
-      - name: Smoke test .exe (start, ping /healthz, stop)
+      - name: List dist
+        run: dir dist
+
+      # Smoke test: start EXE and probe home page
+      - name: Smoke test EXE (serve and probe "/")
         shell: pwsh
-        timeout-minutes: 5
+        env:
+          STREAMLIT_SERVER_HEADLESS: "true"
+          STREAMLIT_SERVER_PORT: "8501"
+          STREAMLIT_SERVER_ADDRESS: "127.0.0.1"
+          STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
         run: |
           $exe = Join-Path "dist" "EvidenceSynthesisApp.exe"
-          if (!(Test-Path $exe)) {
-            Write-Host "❌ No EXE produced at $exe"
-            exit 1
-          }
-
-          # start the program
           Write-Host "Starting $exe ..."
-          $p = Start-Process -FilePath $exe -PassThru -WorkingDirectory (Split-Path $exe)
-
-          # poll for health
-          $ok = $false
-          $url = "http://127.0.0.1:8501/healthz"
-          for ($i=0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 1
-            try {
-              $resp = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 2
-              if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
-                $ok = $true
-                break
+          $p = Start-Process -FilePath $exe -PassThru
+          try {
+            $ok = $false
+            for ($i=0; $i -lt 50; $i++) {
+              try {
+                $res = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8501/" -TimeoutSec 3
+                if ($res.StatusCode -in 200, 302, 403) { $ok = $true; break }
+              } catch {
+                Start-Sleep -Seconds 2
               }
-            } catch { }
-          }
-
-          if (-not $ok) {
-            Write-Host "❌ App did not become healthy on $url"
-            # dump the last 200 lines of stderr/stdout if present
-            Get-ChildItem -Path (Split-Path $exe) -Filter "*.log" -ErrorAction SilentlyContinue | %{
-              Write-Host "--- LOG: $($_.FullName) ---"
-              Get-Content $_.FullName -Tail 200 | Write-Host
             }
+            if (-not $ok) {
+              Write-Host "❌ App did not respond on http://127.0.0.1:8501/"
+              throw "App not healthy"
+            } else {
+              Write-Host "✅ Streamlit responded."
+            }
+          } finally {
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-            exit 1
           }
-
-          Write-Host "✅ App is healthy on $url"
-          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -1,20 +1,23 @@
 # run_app.py
-import sys
-import pathlib
 import os
+import sys
 
-def main():
-    # Ensure headless defaults for CI/EXE
-    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
-    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
-    os.environ.setdefault("STREAMLIT_SERVER_PORT", "8501")
-    os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
+# Respect CI/env defaults but set safe fallbacks
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
+os.environ.setdefault("STREAMLIT_SERVER_PORT", "8501")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 
-    app_path = str(pathlib.Path(__file__).with_name("app.py"))
-    # Invoke Streamlit programmatically
-    from streamlit.web.cli import main as stcli
-    sys.argv = ["streamlit", "run", app_path]
-    sys.exit(stcli())
+# Build the argv just like "streamlit run app.py --server.port=8501 …"
+app_path = os.path.join(os.path.dirname(__file__), "app.py")
+sys.argv = [
+    "streamlit", "run", app_path,
+    f"--server.port={os.environ['STREAMLIT_SERVER_PORT']}",
+    f"--server.address={os.environ['STREAMLIT_SERVER_ADDRESS']}",
+    f"--server.headless={os.environ['STREAMLIT_SERVER_HEADLESS']}",
+    f"--browser.gatherUsageStats={os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS']}",
+]
 
+from streamlit.web import cli as stcli
 if __name__ == "__main__":
-    main()
+    sys.exit(stcli.main())
