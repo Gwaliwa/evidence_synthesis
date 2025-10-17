@@ -1,9 +1,10 @@
 name: Build Windows EXE
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build-windows:
@@ -16,106 +17,93 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('windows-build-requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Upgrade pip tooling
+        run: python -m pip install --upgrade pip setuptools wheel
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
-          pip freeze > pip-freeze.txt
+        run: pip install -r windows-build-requirements.txt
 
-      - name: Build EXE (PyInstaller spec)
-        run: |
-          pyinstaller --clean EvidenceSynthesis.spec
-          if (Test-Path dist) { dir dist -Recurse }
+      # --- Build the EXE using launcher as entrypoint ---
+      - name: Build (onefile + launcher, include metadata)
+        run: >
+          pyinstaller --clean --onefile --noconsole
+          --name EvidenceSynthesisApp
+          --add-data "app.py;."
+          --collect-all streamlit
+          --collect-all pandas
+          --collect-all numpy
+          --collect-all pillow
+          --collect-all PyPDF2
+          --collect-all pdfplumber
+          --collect-all fitz
+          --collect-all pdf2image
+          --collect-all pytesseract
+          --collect-all matplotlib
+          --collect-all openpyxl
+          --collect-all xlsxwriter
+          --copy-metadata streamlit
+          --copy-metadata altair
+          --copy-metadata watchdog
+          --copy-metadata tornado
+          --copy-metadata protobuf
+          launch.py
 
-      - name: Smoke run (headless) + health check
+      # --- Smoke-test the binary: start it, wait for HTTP to respond, then stop ---
+      - name: Smoke test .exe (start, ping /healthz, stop)
         shell: pwsh
-        env:
-          STREAMLIT_SERVER_HEADLESS: "true"
-          STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
-          STREAMLIT_SERVER_PORT: "8501"
-          STREAMLIT_SERVER_ADDRESS: "127.0.0.1"
-          STREAMLIT_LOG_LEVEL: "info"
+        timeout-minutes: 5
         run: |
-          Write-Host "Listing dist contents:"
-          if (Test-Path dist) { dir dist -Recurse } else { Write-Error "dist/ not found"; exit 1 }
-
-          # Find the built EXE (works for onefile or onedir)
-          $exe = Get-ChildItem -Path dist -Recurse -Filter *.exe `
-            | Where-Object { $_.Name -like "*EvidenceSynthesisApp*.exe" } `
-            | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $exe) { Write-Error "Could not find EvidenceSynthesisApp EXE under dist/"; exit 1 }
-
-          $workdir = Split-Path $exe -Parent
-          $stdoutPath = Join-Path $workdir "app-stdout.txt"
-          $stderrPath = Join-Path $workdir "app-stderr.txt"
-
-          Write-Host "Starting $exe with working directory $workdir ..."
-          $p = Start-Process -FilePath $exe `
-                              -WorkingDirectory $workdir `
-                              -PassThru `
-                              -NoNewWindow `
-                              -RedirectStandardOutput $stdoutPath `
-                              -RedirectStandardError  $stderrPath
-
-          # Wait for health (allow extra time for first-run extraction)
-          $deadline = (Get-Date).AddMinutes(4)
-          $ok = $false
-          while ((Get-Date) -lt $deadline) {
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8501/healthz" -UseBasicParsing -TimeoutSec 5
-              if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch {
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          # Clean up the process either way
-          if ($p -and -not $p.HasExited) {
-            try { Stop-Process -Id $p.Id -Force } catch {}
-          }
-
-          if (-not $ok) {
-            Write-Host "=== /healthz did not become healthy ==="
-            Write-Host "--- app stdout (tail) ---"
-            if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Tail 200 -ErrorAction SilentlyContinue } else { Write-Host "(no stdout captured)" }
-            Write-Host "--- app stderr (tail) ---"
-            if (Test-Path $stderrPath) { Get-Content $stderrPath -Tail 200 -ErrorAction SilentlyContinue } else { Write-Host "(no stderr captured)" }
-
-            Write-Host "=== Attempting to print Streamlit logs (if any) ==="
-            $userProfile = [Environment]::GetFolderPath("UserProfile")
-            $logCandidates = @(
-              (Join-Path $userProfile ".streamlit\logs"),
-              (Join-Path $env:APPDATA "Streamlit\logs")
-            )
-            $printed = $false
-            foreach ($ld in $logCandidates) {
-              if (Test-Path $ld) {
-                Write-Host "---- Log directory: $ld ----"
-                Get-ChildItem $ld -Recurse -ErrorAction SilentlyContinue `
-                  | Sort-Object LastWriteTime -Desc `
-                  | Select-Object -First 3 `
-                  | ForEach-Object {
-                      Write-Host "---- Log: $($_.FullName) ----"
-                      Get-Content $_.FullName -Tail 200 -ErrorAction SilentlyContinue
-                      $printed = $true
-                    }
-              }
-            }
-            if (-not $printed) { Write-Host "(No Streamlit logs found.)" }
-
-            Write-Error "App did not become healthy on /healthz"
+          $exe = Join-Path "dist" "EvidenceSynthesisApp.exe"
+          if (!(Test-Path $exe)) {
+            Write-Host "❌ No EXE produced at $exe"
             exit 1
           }
 
-      - name: Upload artifacts
-        if: always()
+          # start the program
+          Write-Host "Starting $exe ..."
+          $p = Start-Process -FilePath $exe -PassThru -WorkingDirectory (Split-Path $exe)
+
+          # poll for health
+          $ok = $false
+          $url = "http://127.0.0.1:8501/healthz"
+          for ($i=0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $resp = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+                $ok = $true
+                break
+              }
+            } catch { }
+          }
+
+          if (-not $ok) {
+            Write-Host "❌ App did not become healthy on $url"
+            # dump the last 200 lines of stderr/stdout if present
+            Get-ChildItem -Path (Split-Path $exe) -Filter "*.log" -ErrorAction SilentlyContinue | %{
+              Write-Host "--- LOG: $($_.FullName) ---"
+              Get-Content $_.FullName -Tail 200 | Write-Host
+            }
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            exit 1
+          }
+
+          Write-Host "✅ App is healthy on $url"
+          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: |
-            dist/**
-            pip-freeze.txt
-            **/streamlit*.log
-          if-no-files-found: warn
+          name: app-windows-exe
+          path: dist/EvidenceSynthesisApp.exe
+          if-no-files-found: error

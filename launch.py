@@ -2,7 +2,6 @@
 import os
 import sys
 
-# Where the unpacked files live when frozen
 BASE = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
 
 def main():
@@ -10,20 +9,24 @@ def main():
     if not os.path.exists(app_path):
         raise FileNotFoundError(f"Cannot find app.py at {app_path}")
 
-    # Programmatic entry into Streamlit CLI (works in frozen apps)
+    # Launch Streamlit programmatically (works inside PyInstaller)
     from streamlit.web import cli as stcli
 
-    # Build argv just like "streamlit run app.py ..."
+    # Make Streamlit totally headless & predictable for CI smoke test
+    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
+    os.environ.setdefault("STREAMLIT_SERVER_PORT", "8501")
+
     sys.argv = [
         "streamlit",
         "run",
         app_path,
         "--server.headless", "true",
-        "--server.address", "127.0.0.1",
-        "--server.port", os.environ.get("PORT", "8501"),
+        "--server.address", os.environ["STREAMLIT_SERVER_ADDRESS"],
+        "--server.port", os.environ["STREAMLIT_SERVER_PORT"],
         "--browser.gatherUsageStats", "false",
     ]
-    # This starts the Streamlit server and blocks
     sys.exit(stcli.main())
 
 if __name__ == "__main__":

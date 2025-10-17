@@ -1,12 +1,17 @@
-# Minimal set to prove pipeline works
+# --- core runtime deps your app imports ---
 streamlit
 pandas
 numpy
-pypdf
-openpyxl
+matplotlib
+pdfplumber
+PyPDF2
+pytesseract
+pillow
+pdf2image
 
-# Build tool
+# excel writers (your app exports xlsx)
+openpyxl
+xlsxwriter
+
+# --- builder ---
 pyinstaller==6.16.0
-altgraph
-pefile
-pywin32-ctypes
